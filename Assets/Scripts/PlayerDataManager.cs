@@ -15,6 +15,7 @@ public static class PlayerDataManager
     public static int Trophies { get; private set; } = 0;
     public static int AvatarIndex { get; private set; } = 0;
     public static bool HasSetupProfile { get; private set; } = false;
+    public static int LastRewardedMilestone { get; private set; } = 0; // ← NEW
 
     // ── PlayFab ID ────────────────────────────────────────────────────────────
 
@@ -38,9 +39,10 @@ public static class PlayerDataManager
         Trophies = statsData.trophies;
         AvatarIndex = statsData.avatarIndex;
         HasSetupProfile = statsData.hasSetupProfile;
+        LastRewardedMilestone = statsData.lastRewardedMilestone; // ← NEW
 
         Debug.Log(
-            $"[PlayerDataManager] Initialized: {DisplayName}, Coins: {Coins}, Trophies: {Trophies}, Avatar: {AvatarIndex}");
+            $"[PlayerDataManager] Initialized: {DisplayName}, Coins: {Coins}, Trophies: {Trophies}, Avatar: {AvatarIndex}, LastMilestone: {LastRewardedMilestone}");
     }
 
     // ── Update Methods ────────────────────────────────────────────────────────
@@ -64,14 +66,27 @@ public static class PlayerDataManager
     public static void AddTrophies(int amount)
         => Trophies += amount;
 
-    // ── Helper ────────────────────────────────────────────────────────────────
+    public static void UpdateLastRewardedMilestone(int milestone)
+        => LastRewardedMilestone = milestone;
 
+    // ── Trophy Helpers ────────────────────────────────────────────────────────
+
+    /// <summary>Progress within current 20-trophy cycle (0-19).</summary>
     public static int GetTrophyProgress() => Trophies % 20;
-    public static int GetTrophyMilestone() => Trophies / 20;
 
-    /// <summary>
-    /// Generates a random player name based on login type.
-    /// </summary>
+    /// <summary>Current milestone number (0, 1, 2, 3... for 0, 20, 40, 60...).</summary>
+    public static int GetCurrentMilestone() => Trophies / 20;
+
+    /// <summary>Check if user reached a NEW unrewarded milestone.</summary>
+    public static bool HasUnrewardedMilestone()
+    {
+        int currentMilestone = GetCurrentMilestone();
+        return currentMilestone > LastRewardedMilestone;
+    }
+
+    // ── Name Generation ───────────────────────────────────────────────────────
+
+    /// <summary>Generates a random player name based on login type.</summary>
     public static string GenerateRandomName(bool isGuest)
     {
         string prefix = isGuest ? "Guest" : "Player";
@@ -89,4 +104,5 @@ public class PlayerStatsData
     public int trophies = 0;
     public int avatarIndex = 0;
     public bool hasSetupProfile = false;
+    public int lastRewardedMilestone = 0; // ← NEW: tracks which milestone was last rewarded
 }

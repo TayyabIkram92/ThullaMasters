@@ -75,4 +75,12 @@ public static partial class EventManager
 
     public static void FireAwardTrophyRewardRequested()
         => OnAwardTrophyRewardRequested?.Invoke();
+
+    // ── Coin Management Events ────────────────────────────────────────────────
+
+    /// <summary>Request to deduct coins from PlayFab.</summary>
+    public static event Action<int> OnDeductCoinsRequested;
+
+    public static void FireDeductCoinsRequested(int amount)
+        => OnDeductCoinsRequested?.Invoke(amount);
 }

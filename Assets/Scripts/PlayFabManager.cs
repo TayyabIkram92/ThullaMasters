@@ -1,6 +1,8 @@
 using UnityEngine;
 using PlayFab;
 using PlayFab.ClientModels;
+using System.Collections;
+using System.Collections.Generic;
 
 public class PlayFabManager : MonoBehaviour
 {
@@ -16,6 +18,7 @@ public class PlayFabManager : MonoBehaviour
         EventManager.OnGuestLoginRequested += HandleGuestLogin;
         EventManager.OnUpdateProfileRequested += HandleUpdateProfile;
         EventManager.OnAwardTrophyRewardRequested += HandleAwardTrophyReward;
+        EventManager.OnDeductCoinsRequested += HandleDeductCoins;
     }
 
     private void OnDisable()
@@ -26,60 +29,7 @@ public class PlayFabManager : MonoBehaviour
         EventManager.OnGuestLoginRequested -= HandleGuestLogin;
         EventManager.OnUpdateProfileRequested -= HandleUpdateProfile;
         EventManager.OnAwardTrophyRewardRequested -= HandleAwardTrophyReward;
-    }
-// ── NEW: Fetch Player Data ────────────────────────────────────────────────
-
-    /// <summary>
-    /// Called after any successful login/register.
-    /// Fetches DisplayName, Coins, and PlayerStats in one call.
-    /// </summary>
-    private void FetchPlayerData()
-    {
-        PlayFabClientAPI.GetPlayerCombinedInfo(
-            new GetPlayerCombinedInfoRequest
-            {
-                InfoRequestParameters = new GetPlayerCombinedInfoRequestParams
-                {
-                    GetPlayerProfile = true,
-                    GetUserVirtualCurrency = true,
-                    GetUserData = true
-                }
-            },
-            result =>
-            {
-                string playfabId = result.InfoResultPayload.AccountInfo.PlayFabId;
-                string displayName = result.InfoResultPayload.PlayerProfile?.DisplayName ?? "";
-                int coins = result.InfoResultPayload.UserVirtualCurrency.ContainsKey("CO")
-                    ? result.InfoResultPayload.UserVirtualCurrency["CO"]
-                    : 0;
-
-                // Parse PlayerStats JSON
-                PlayerStatsData statsData = new PlayerStatsData();
-                if (result.InfoResultPayload.UserData.ContainsKey("PlayerStats"))
-                {
-                    string json = result.InfoResultPayload.UserData["PlayerStats"].Value;
-                    try
-                    {
-                        statsData = JsonUtility.FromJson<PlayerStatsData>(json);
-                    }
-                    catch
-                    {
-                        Debug.LogWarning("[PlayFabManager] Failed to parse PlayerStats. Using defaults.");
-                    }
-                }
-
-                // If no display name exists, generate one
-                if (string.IsNullOrEmpty(displayName))
-                {
-                    bool isGuest = PlayerPrefs.HasKey(GuestIdKey);
-                    displayName = PlayerDataManager.GenerateRandomName(isGuest);
-                }
-
-                // Initialize the static cache
-                PlayerDataManager.Initialize(playfabId, displayName, coins, statsData);
-                EventManager.FirePlayerDataLoaded();
-            },
-            error => { Debug.LogError($"[PlayFabManager] FetchPlayerData error: {error.GenerateErrorReport()}"); });
+        EventManager.OnDeductCoinsRequested -= HandleDeductCoins;
     }
 
     // ── Auto Login ────────────────────────────────────────────────────────────
@@ -92,13 +42,18 @@ public class PlayFabManager : MonoBehaviour
                 new LoginWithCustomIDRequest
                 {
                     CustomId = PlayerPrefs.GetString(GuestIdKey),
-                    CreateAccount = false
+                    CreateAccount = false,
+                    InfoRequestParameters = new GetPlayerCombinedInfoRequestParams
+                    {
+                        GetPlayerProfile = true,
+                        GetUserVirtualCurrency = true,
+                        GetUserData = true
+                    }
                 },
-                _ =>
+                result =>
                 {
                     Debug.Log("[PlayFabManager] Auto-login success.");
-                    EventManager.FireAutoLoginChecked(true);
-                    EventManager.FireAutoLoginChecked(true);
+                    StartCoroutine(ParseAndCachePlayerDataDelayed(result.InfoResultPayload, true));
                 },
                 error =>
                 {
@@ -120,13 +75,18 @@ public class PlayFabManager : MonoBehaviour
             new LoginWithEmailAddressRequest
             {
                 Email = email,
-                Password = password
+                Password = password,
+                InfoRequestParameters = new GetPlayerCombinedInfoRequestParams
+                {
+                    GetPlayerProfile = true,
+                    GetUserVirtualCurrency = true,
+                    GetUserData = true
+                }
             },
-            _ =>
+            result =>
             {
                 Debug.Log("[PlayFabManager] Login success.");
-                FetchPlayerData();
-                EventManager.FireAuthSuccess();
+                StartCoroutine(ParseAndCachePlayerDataDelayed(result.InfoResultPayload, false));
             },
             error =>
             {
@@ -177,13 +137,18 @@ public class PlayFabManager : MonoBehaviour
             new LoginWithEmailAddressRequest
             {
                 Email = email,
-                Password = password
+                Password = password,
+                InfoRequestParameters = new GetPlayerCombinedInfoRequestParams
+                {
+                    GetPlayerProfile = true,
+                    GetUserVirtualCurrency = true,
+                    GetUserData = true
+                }
             },
-            _ =>
+            result =>
             {
                 Debug.Log("[PlayFabManager] Post-register login success.");
-                FetchPlayerData();
-                EventManager.FireAuthSuccess();
+                StartCoroutine(ParseAndCachePlayerDataDelayed(result.InfoResultPayload, false));
             },
             error => { Debug.LogError($"[PlayFabManager] Post-register login error: {error.GenerateErrorReport()}"); });
     }
@@ -199,18 +164,82 @@ public class PlayFabManager : MonoBehaviour
             new LoginWithCustomIDRequest
             {
                 CustomId = PlayerPrefs.GetString(GuestIdKey),
-                CreateAccount = true
+                CreateAccount = true,
+                InfoRequestParameters = new GetPlayerCombinedInfoRequestParams
+                {
+                    GetPlayerProfile = true,
+                    GetUserVirtualCurrency = true,
+                    GetUserData = true
+                }
             },
-            _ =>
+            result =>
             {
                 Debug.Log("[PlayFabManager] Guest login success.");
-                FetchPlayerData();
-                EventManager.FireAuthSuccess();
+                StartCoroutine(ParseAndCachePlayerDataDelayed(result.InfoResultPayload, false));
             },
             error => { Debug.LogError($"[PlayFabManager] Guest login error: {error.GenerateErrorReport()}"); });
     }
 
-    // ── NEW: Update Profile ───────────────────────────────────────────────────
+    // ── Parse PlayFab Data (DELAYED to avoid race condition) ─────────────────
+
+    private IEnumerator ParseAndCachePlayerDataDelayed(GetPlayerCombinedInfoResultPayload payload, bool isAutoLogin)
+    {
+        // Wait one frame to guarantee all OnEnable subscriptions are complete
+        yield return null;
+
+        // Extract PlayFabId
+        string playfabId = payload?.AccountInfo?.PlayFabId ?? "";
+
+        // Extract DisplayName
+        string displayName = payload?.PlayerProfile?.DisplayName;
+
+        // Extract Coins
+        int coins = 0;
+        if (payload?.UserVirtualCurrency != null &&
+            payload.UserVirtualCurrency.ContainsKey("CO"))
+        {
+            coins = payload.UserVirtualCurrency["CO"];
+        }
+
+        // Extract PlayerStats
+        PlayerStatsData statsData = new PlayerStatsData();
+        if (payload?.UserData != null &&
+            payload.UserData.ContainsKey("PlayerStats"))
+        {
+            try
+            {
+                string json = payload.UserData["PlayerStats"].Value;
+                statsData = JsonUtility.FromJson<PlayerStatsData>(json);
+            }
+            catch
+            {
+                Debug.LogWarning("[PlayFabManager] Failed to parse PlayerStats. Using defaults.");
+            }
+        }
+
+        // Generate name if missing
+        if (string.IsNullOrEmpty(displayName))
+        {
+            bool isGuest = PlayerPrefs.HasKey(GuestIdKey);
+            displayName = PlayerDataManager.GenerateRandomName(isGuest);
+            Debug.Log($"[PlayFabManager] No DisplayName found. Generated: {displayName}");
+        }
+
+        // Cache everything
+        PlayerDataManager.Initialize(playfabId, displayName, coins, statsData);
+
+        // Fire appropriate events
+        if (isAutoLogin)
+        {
+            EventManager.FireAutoLoginChecked(true);
+        }
+
+        EventManager.FirePlayerDataLoaded();
+
+        Debug.Log("[PlayFabManager] PlayerDataLoaded event fired.");
+    }
+
+    // ── Update Profile ────────────────────────────────────────────────────────
 
     private void HandleUpdateProfile(string displayName, int avatarIndex)
     {
@@ -220,30 +249,17 @@ public class PlayFabManager : MonoBehaviour
             _ => Debug.Log($"[PlayFabManager] DisplayName updated: {displayName}"),
             error => Debug.LogError($"[PlayFabManager] UpdateDisplayName error: {error.GenerateErrorReport()}"));
 
-        // Update PlayerStats JSON
-        var statsData = new PlayerStatsData
-        {
-            trophies = PlayerDataManager.Trophies,
-            avatarIndex = avatarIndex,
-            hasSetupProfile = true
-        };
-
-        PlayFabClientAPI.UpdateUserData(
-            new UpdateUserDataRequest
-            {
-                Data = new System.Collections.Generic.Dictionary<string, string>
-                {
-                    { "PlayerStats", JsonUtility.ToJson(statsData) }
-                }
-            },
-            _ => Debug.Log("[PlayFabManager] PlayerStats updated."),
-            error => Debug.LogError($"[PlayFabManager] UpdateUserData error: {error.GenerateErrorReport()}"));
+        // Update PlayerStats
+        PlayerDataManager.UpdateProfile(displayName, avatarIndex);
+        SavePlayerStatsToPlayFab(); // ← Use shared helper
     }
 
-// ── NEW: Award Trophy Reward ──────────────────────────────────────────────
+    // ── Award Trophy Reward ───────────────────────────────────────────────────
 
     private void HandleAwardTrophyReward()
     {
+        int currentMilestone = PlayerDataManager.GetCurrentMilestone();
+
         PlayFabClientAPI.AddUserVirtualCurrency(
             new AddUserVirtualCurrencyRequest
             {
@@ -252,35 +268,70 @@ public class PlayFabManager : MonoBehaviour
             },
             result =>
             {
-                PlayerDataManager.AddCoins(10);
-                Debug.Log($"[PlayFabManager] Trophy reward granted. New balance: {result.Balance}");
+                // Update coins from PlayFab (validation)
+                PlayerDataManager.UpdateCoins(result.Balance);
+                Debug.Log(
+                    $"[PlayFabManager] Trophy reward granted for milestone {currentMilestone}. New balance: {result.Balance}");
 
-                // Update trophies to remove the milestone
-                int newTrophies = PlayerDataManager.Trophies % 20;
-                PlayerDataManager.UpdateTrophies(newTrophies);
-                SaveTrophiesToPlayFab(newTrophies);
+                // Mark this milestone as rewarded
+                PlayerDataManager.UpdateLastRewardedMilestone(currentMilestone);
+
+                // Save updated milestone to PlayFab
+                SavePlayerStatsToPlayFab();
+
+                // Refresh UI
+                var homePage = UnityEngine.Object.FindObjectOfType<HomePageView>();
+                if (homePage != null)
+                    homePage.RefreshUI();
             },
-            error => Debug.LogError($"[PlayFabManager] AwardTrophyReward error: {error.GenerateErrorReport()}"));
+            error => { Debug.LogError($"[PlayFabManager] AwardTrophyReward error: {error.GenerateErrorReport()}"); });
     }
 
-    private void SaveTrophiesToPlayFab(int newTrophies)
+    // ── Helper: Save All Player Stats ────────────────────────────────────────
+
+    private void SavePlayerStatsToPlayFab()
     {
         var statsData = new PlayerStatsData
         {
-            trophies = newTrophies,
+            trophies = PlayerDataManager.Trophies,
             avatarIndex = PlayerDataManager.AvatarIndex,
-            hasSetupProfile = PlayerDataManager.HasSetupProfile
+            hasSetupProfile = PlayerDataManager.HasSetupProfile,
+            lastRewardedMilestone = PlayerDataManager.LastRewardedMilestone
         };
 
         PlayFabClientAPI.UpdateUserData(
             new UpdateUserDataRequest
             {
-                Data = new System.Collections.Generic.Dictionary<string, string>
+                Data = new Dictionary<string, string>
                 {
                     { "PlayerStats", JsonUtility.ToJson(statsData) }
                 }
             },
-            _ => Debug.Log("[PlayFabManager] Trophies saved after reward."),
-            error => Debug.LogError($"[PlayFabManager] SaveTrophies error: {error.GenerateErrorReport()}"));
+            _ => Debug.Log("[PlayFabManager] PlayerStats saved."),
+            error => Debug.LogError($"[PlayFabManager] SavePlayerStats error: {error.GenerateErrorReport()}"));
+    }
+
+    // ── Deduct Coins ──────────────────────────────────────────────────────────
+
+    private void HandleDeductCoins(int amount)
+    {
+        PlayFabClientAPI.SubtractUserVirtualCurrency(
+            new SubtractUserVirtualCurrencyRequest
+            {
+                VirtualCurrency = "CO",
+                Amount = amount
+            },
+            result =>
+            {
+                Debug.Log($"[PlayFabManager] Deducted {amount} coins. New balance: {result.Balance}");
+                // Update local cache to match PlayFab
+                PlayerDataManager.UpdateCoins(result.Balance);
+            },
+            error =>
+            {
+                Debug.LogError($"[PlayFabManager] DeductCoins error: {error.GenerateErrorReport()}");
+                // Rollback local deduction on error
+                PlayerDataManager.AddCoins(amount);
+            });
     }
 }

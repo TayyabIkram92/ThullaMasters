@@ -36350,7 +36350,7 @@ MonoBehaviour:
   previewAvatarImage: {fileID: 864902038}
   nameInputField: {fileID: 1310712276}
   costBG: {fileID: 1544355123}
-  coinsText: {fileID: 728328254}
+  costText: {fileID: 728328254}
   confirmButton: {fileID: 631601}
   closeButton: {fileID: 244596030}
   avatarSprites:
@@ -42675,6 +42675,7 @@ MonoBehaviour:
   profileAvatarImage: {fileID: 2107410460}
   nameText: {fileID: 1142828745}
   trophySlider: {fileID: 1810126827}
+  trophyProgressText: {fileID: 404661959}
   coinsText: {fileID: 1103076931}
   plusButton: {fileID: 1368756065}
   buyButton: {fileID: 2137127859}
