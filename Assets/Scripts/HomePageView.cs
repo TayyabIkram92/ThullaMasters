@@ -9,6 +9,7 @@ public class HomePageView : MonoBehaviour
 
     [SerializeField] private Image profileAvatarImage;
     [SerializeField] private Text nameText;
+    [SerializeField] private Text playerIdText;
 
     [Header("Trophy Section")] [SerializeField]
     private Slider trophySlider;
@@ -46,13 +47,13 @@ public class HomePageView : MonoBehaviour
         if (sellButton != null)
             sellButton.onClick.AddListener(() => Debug.Log("[HomePageView] Sell button clicked."));
         if (classicModeButton != null)
-            classicModeButton.onClick.AddListener(() => Debug.Log("[HomePageView] Classic Mode clicked."));
+            classicModeButton.onClick.AddListener(OnClassicModeClicked);
         if (playWithFriendsButton != null)
             playWithFriendsButton.onClick.AddListener(() => Debug.Log("[HomePageView] Play With Friends clicked."));
         if (tutorialButton != null)
             tutorialButton.onClick.AddListener(() => Debug.Log("[HomePageView] Tutorial clicked."));
         if (friendsButton != null)
-            friendsButton.onClick.AddListener(() => Debug.Log("[HomePageView] Friends clicked."));
+            friendsButton.onClick.AddListener(OnFriendsClicked);
         if (settingsButton != null)
             settingsButton.onClick.AddListener(() => Debug.Log("[HomePageView] Settings clicked."));
     }
@@ -75,8 +76,29 @@ public class HomePageView : MonoBehaviour
         if (tutorialButton != null) tutorialButton.onClick.RemoveAllListeners();
         if (friendsButton != null) friendsButton.onClick.RemoveAllListeners();
         if (settingsButton != null) settingsButton.onClick.RemoveAllListeners();
+
+        EventManager.OnGameModesFetched -= NavigateToGameSelection;
+        EventManager.OnFriendsFetched -= NavigateToFriends;
     }
 
+    private void OnFriendsClicked()
+    {
+        if (!FriendsManager.IsInitialized)
+        {
+            EventManager.FireFetchFriendsRequested();
+            EventManager.OnFriendsFetched += NavigateToFriends;
+        }
+        else
+        {
+            NavigateToFriends();
+        }
+    }
+
+    private void NavigateToFriends()
+    {
+        EventManager.OnFriendsFetched -= NavigateToFriends;
+        EventManager.FireShowView(ViewType.Friends, showAsDialogue: true);
+    }
     // ── UI Refresh ────────────────────────────────────────────────────────────
 
     public void RefreshUI()
@@ -85,6 +107,8 @@ public class HomePageView : MonoBehaviour
         if (nameText != null)
             nameText.text = PlayerDataManager.DisplayName;
 
+        if (playerIdText != null)
+            playerIdText.text = PlayerDataManager.DisplayName;
         // Avatar
         if (profileAvatarImage != null &&
             PlayerDataManager.AvatarIndex >= 0 &&
@@ -144,5 +168,29 @@ public class HomePageView : MonoBehaviour
     private void OnProfileClicked()
     {
         EventManager.FireShowView(ViewType.Profile, showAsDialogue: true);
+    }
+
+    private void OnClassicModeClicked()
+    {
+        // Fetch game modes if not already cached
+        if (!GameModeManager.IsInitialized)
+        {
+            EventManager.FireFetchGameModesRequested();
+            // Subscribe to wait for fetch completion
+            EventManager.OnGameModesFetched += NavigateToGameSelection;
+        }
+        else
+        {
+            NavigateToGameSelection();
+        }
+    }
+
+    private void NavigateToGameSelection()
+    {
+        // Unsubscribe
+        EventManager.OnGameModesFetched -= NavigateToGameSelection;
+
+        // Navigate
+        EventManager.FireShowView(ViewType.GameSelection);
     }
 }

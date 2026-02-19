@@ -7,6 +7,10 @@ namespace UI
         Home,
         Profile,
         UserPopUp,
-        GuestConfirmation
+        GuestConfirmation,
+        GameSelection,
+        Friends, // ← NEW
+        AddFriend, // ← NEW
+        DeleteFriend
     }
 }

@@ -41,6 +41,14 @@ public static partial class EventManager
     public static void FireAutoLoginRequested()
         => OnAutoLoginRequested?.Invoke();
 
+    // ── Username Validation Events ────────────────────────────────────────────
+
+    /// <summary>Request to check if username is available.</summary>
+    public static event Action<string, System.Action<bool>> OnCheckUsernameAvailability;
+
+    public static void FireCheckUsernameAvailability(string username, System.Action<bool> callback)
+        => OnCheckUsernameAvailability?.Invoke(username, callback);
+
     // ── PlayFab Result Events (PlayFab → UI) ──────────────────────────────────
 
     public static event Action OnAuthSuccess;
@@ -83,4 +91,68 @@ public static partial class EventManager
 
     public static void FireDeductCoinsRequested(int amount)
         => OnDeductCoinsRequested?.Invoke(amount);
+
+    // ── Game Mode Events ──────────────────────────────────────────────────────
+
+    /// <summary>Request to fetch game mode config from PlayFab.</summary>
+    public static event Action OnFetchGameModesRequested;
+
+    /// <summary>Game modes fetched and cached.</summary>
+    public static event Action OnGameModesFetched;
+
+    /// <summary>User selected a game mode card.</summary>
+    public static event Action<GameModeData> OnGameModeSelected;
+
+    public static void FireFetchGameModesRequested()
+        => OnFetchGameModesRequested?.Invoke();
+
+    public static void FireGameModesFetched()
+        => OnGameModesFetched?.Invoke();
+
+    public static void FireGameModeSelected(GameModeData modeData)
+        => OnGameModeSelected?.Invoke(modeData);
+
+    // ── Friends Events ────────────────────────────────────────────────────────
+
+    /// <summary>Request to fetch friends list from PlayFab.</summary>
+    public static event Action OnFetchFriendsRequested;
+
+    /// <summary>Friends list fetched and cached.</summary>
+    public static event Action OnFriendsFetched;
+
+    /// <summary>Request to add friend by Player ID.</summary>
+    public static event Action<string> OnAddFriendRequested;
+
+    /// <summary>Friend added successfully.</summary>
+    public static event Action<FriendData> OnFriendAdded;
+
+    /// <summary>Failed to add friend (invalid ID, etc.).</summary>
+    public static event Action<string> OnAddFriendFailed;
+
+    /// <summary>Request to remove friend.</summary>
+    public static event Action<string> OnRemoveFriendRequested;
+
+    /// <summary>Friend removed successfully.</summary>
+    public static event Action OnFriendRemoved;
+
+    public static void FireFetchFriendsRequested()
+        => OnFetchFriendsRequested?.Invoke();
+
+    public static void FireFriendsFetched()
+        => OnFriendsFetched?.Invoke();
+
+    public static void FireAddFriendRequested(string playerId)
+        => OnAddFriendRequested?.Invoke(playerId);
+
+    public static void FireFriendAdded(FriendData friend)
+        => OnFriendAdded?.Invoke(friend);
+
+    public static void FireAddFriendFailed(string reason)
+        => OnAddFriendFailed?.Invoke(reason);
+
+    public static void FireRemoveFriendRequested(string playfabId)
+        => OnRemoveFriendRequested?.Invoke(playfabId);
+
+    public static void FireFriendRemoved()
+        => OnFriendRemoved?.Invoke();
 }

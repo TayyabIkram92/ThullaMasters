@@ -15,7 +15,7 @@ public static class PlayerDataManager
     public static int Trophies { get; private set; } = 0;
     public static int AvatarIndex { get; private set; } = 0;
     public static bool HasSetupProfile { get; private set; } = false;
-    public static int LastRewardedMilestone { get; private set; } = 0; // ← NEW
+    public static int LastRewardedMilestone { get; private set; } = 0;
 
     // ── PlayFab ID ────────────────────────────────────────────────────────────
 
@@ -23,10 +23,6 @@ public static class PlayerDataManager
 
     // ── Initialization ────────────────────────────────────────────────────────
 
-    /// <summary>
-    /// Called once after successful login/register.
-    /// Populates all fields from PlayFab response.
-    /// </summary>
     public static void Initialize(
         string playfabId,
         string displayName,
@@ -39,10 +35,9 @@ public static class PlayerDataManager
         Trophies = statsData.trophies;
         AvatarIndex = statsData.avatarIndex;
         HasSetupProfile = statsData.hasSetupProfile;
-        LastRewardedMilestone = statsData.lastRewardedMilestone; // ← NEW
+        LastRewardedMilestone = statsData.lastRewardedMilestone;
 
-        Debug.Log(
-            $"[PlayerDataManager] Initialized: {DisplayName}, Coins: {Coins}, Trophies: {Trophies}, Avatar: {AvatarIndex}, LastMilestone: {LastRewardedMilestone}");
+        Debug.Log($"[PlayerDataManager] Initialized: Name={DisplayName}, Coins={Coins}, Trophies={Trophies}");
     }
 
     // ── Update Methods ────────────────────────────────────────────────────────
@@ -71,38 +66,38 @@ public static class PlayerDataManager
 
     // ── Trophy Helpers ────────────────────────────────────────────────────────
 
-    /// <summary>Progress within current 20-trophy cycle (0-19).</summary>
     public static int GetTrophyProgress() => Trophies % 20;
-
-    /// <summary>Current milestone number (0, 1, 2, 3... for 0, 20, 40, 60...).</summary>
     public static int GetCurrentMilestone() => Trophies / 20;
 
-    /// <summary>Check if user reached a NEW unrewarded milestone.</summary>
     public static bool HasUnrewardedMilestone()
     {
         int currentMilestone = GetCurrentMilestone();
         return currentMilestone > LastRewardedMilestone;
     }
 
-    // ── Name Generation ───────────────────────────────────────────────────────
+    // ── Username Generation ───────────────────────────────────────────────────
 
-    /// <summary>Generates a random player name based on login type.</summary>
-    public static string GenerateRandomName(bool isGuest)
+    public static string GenerateRandomUsername(bool isGuest)
     {
+        const string chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        System.Random random = new System.Random();
+        char[] randomPart = new char[8];
+
+        for (int i = 0; i < 8; i++)
+        {
+            randomPart[i] = chars[random.Next(chars.Length)];
+        }
+
         string prefix = isGuest ? "Guest" : "Player";
-        int randomNum = UnityEngine.Random.Range(10000, 99999);
-        return $"{prefix}{randomNum}";
+        return $"{prefix}_{new string(randomPart)}";
     }
 }
 
-/// <summary>
-/// JSON structure for PlayerStats stored in PlayFab UserData.
-/// </summary>
 [Serializable]
 public class PlayerStatsData
 {
     public int trophies = 0;
     public int avatarIndex = 0;
     public bool hasSetupProfile = false;
-    public int lastRewardedMilestone = 0; // ← NEW: tracks which milestone was last rewarded
+    public int lastRewardedMilestone = 0;
 }
