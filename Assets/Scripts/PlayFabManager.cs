@@ -207,6 +207,7 @@ public class PlayFabManager : MonoBehaviour
         }
 
         PlayerStatsData statsData = new PlayerStatsData();
+
         if (payload?.UserData != null &&
             payload.UserData.ContainsKey("PlayerStats"))
         {
@@ -217,16 +218,19 @@ public class PlayFabManager : MonoBehaviour
             }
             catch
             {
-                Debug.LogWarning("[PlayFabManager] Failed to parse PlayerStats. Using defaults.");
+                Debug.LogWarning("[PlayFabManager] Failed to parse PlayerStats.");
             }
         }
+        else
+        {
+            Debug.Log("[PlayFabManager] No PlayerStats found. Saving defaults.");
+            SavePlayerStatsToPlayFab();
+        }
 
-        // Generate unique username if missing
         if (string.IsNullOrEmpty(displayName))
         {
             bool isGuest = PlayerPrefs.HasKey(GuestIdKey);
             displayName = PlayerDataManager.GenerateRandomUsername(isGuest);
-            Debug.Log($"[PlayFabManager] No DisplayName found. Generated: {displayName}");
         }
 
         PlayerDataManager.Initialize(playfabId, displayName, coins, statsData);
@@ -237,7 +241,6 @@ public class PlayFabManager : MonoBehaviour
         }
 
         EventManager.FirePlayerDataLoaded();
-        Debug.Log("[PlayFabManager] PlayerDataLoaded event fired.");
     }
 
     // ── Update Profile ────────────────────────────────────────────────────────
@@ -409,25 +412,22 @@ public class PlayFabManager : MonoBehaviour
                 result =>
                 {
                     PlayerStatsData stats = new PlayerStatsData();
-                    if (result.Data.ContainsKey("PlayerStats"))
+
+                    if (result.Data != null && result.Data.ContainsKey("PlayerStats"))
                     {
                         try
                         {
-                            string json = result.Data["PlayerStats"].Value;
-                            stats = JsonUtility.FromJson<PlayerStatsData>(json);
+                            stats = JsonUtility.FromJson<PlayerStatsData>(result.Data["PlayerStats"].Value);
                         }
                         catch
                         {
                         }
                     }
 
-                    string displayName = friendInfo.Profile?.DisplayName ?? "Unknown";
-
                     friendData = new FriendData(
                         friendInfo.FriendPlayFabId,
-                        displayName,
+                        friendInfo.Profile?.DisplayName ?? "Unknown",
                         stats.trophies,
-                        0,
                         stats.avatarIndex
                     );
 
@@ -435,7 +435,12 @@ public class PlayFabManager : MonoBehaviour
                 },
                 error =>
                 {
-                    Debug.LogWarning($"[PlayFabManager] Failed to fetch data for friend: {friendInfo.FriendPlayFabId}");
+                    friendData = new FriendData(
+                        friendInfo.FriendPlayFabId,
+                        friendInfo.Profile?.DisplayName ?? "Unknown",
+                        0,
+                        0
+                    );
                     dataFetched = true;
                 });
 
@@ -454,53 +459,61 @@ public class PlayFabManager : MonoBehaviour
 
     private void HandleAddFriend(string username)
     {
+        // 1) Resolve username -> PlayFabId
         PlayFabClientAPI.GetAccountInfo(
-            new GetAccountInfoRequest
+            new GetAccountInfoRequest { TitleDisplayName = username },
+            acc =>
             {
-                TitleDisplayName = username
-            },
-            result =>
-            {
-                string friendPlayFabId = result.AccountInfo.PlayFabId;
-
-                if (friendPlayFabId == PlayerDataManager.PlayFabId)
+                var friendId = acc.AccountInfo?.PlayFabId;
+                if (string.IsNullOrEmpty(friendId))
                 {
-                    EventManager.FireAddFriendFailed("You cannot add yourself as a friend.");
+                    EventManager.FireAddFriendFailed($"Username '{username}' not found.");
                     return;
                 }
 
+                // 2) Add friend by PlayFabId (more reliable)
                 PlayFabClientAPI.AddFriend(
-                    new AddFriendRequest { FriendPlayFabId = friendPlayFabId },
-                    addResult =>
+                    new AddFriendRequest { FriendPlayFabId = friendId },
+                    _ =>
                     {
-                        Debug.Log($"[PlayFabManager] Friend added: {username}");
-                        FetchSingleFriendData(friendPlayFabId);
+                        // 3) Fetch and cache that single friend + notify UI
+                        FetchSingleFriendData(friendId); // this already does FireFriendAdded(friendData)
+
+                        // Optional: refresh full list in background
+                        // HandleFetchFriends();
                     },
                     error =>
                     {
                         if (error.Error == PlayFabErrorCode.UsersAlreadyFriends)
-                        {
                             EventManager.FireAddFriendFailed("Already friends with this user.");
-                        }
                         else
-                        {
-                            Debug.LogError($"[PlayFabManager] AddFriend error: {error.GenerateErrorReport()}");
-                            EventManager.FireAddFriendFailed("Failed to add friend.");
-                        }
-                    });
+                            EventManager.FireAddFriendFailed($"Error: {error.ErrorMessage}");
+                    }
+                );
             },
             error =>
             {
                 if (error.Error == PlayFabErrorCode.AccountNotFound)
-                {
-                    EventManager.FireAddFriendFailed("Username not found.");
-                }
+                    EventManager.FireAddFriendFailed($"Username '{username}' not found.");
                 else
-                {
-                    Debug.LogError($"[PlayFabManager] GetAccountInfo error: {error.GenerateErrorReport()}");
-                    EventManager.FireAddFriendFailed("Failed to find user.");
-                }
-            });
+                    EventManager.FireAddFriendFailed($"Error: {error.ErrorMessage}");
+            }
+        );
+    }
+
+    private IEnumerator DelayedFriendRefresh(string username)
+    {
+        // Wait a moment for PlayFab to sync
+        yield return new WaitForSeconds(0.5f);
+
+        // Fetch updated friends list
+        HandleFetchFriends();
+    }
+
+    private void RefreshFriendsListAfterAdd()
+    {
+        // Fetch friends list again to get the new friend's data
+        HandleFetchFriends();
     }
 
     private void FetchSingleFriendData(string playfabId)
@@ -514,12 +527,12 @@ public class PlayFabManager : MonoBehaviour
             result =>
             {
                 PlayerStatsData stats = new PlayerStatsData();
-                if (result.Data.ContainsKey("PlayerStats"))
+
+                if (result.Data != null && result.Data.ContainsKey("PlayerStats"))
                 {
                     try
                     {
-                        string json = result.Data["PlayerStats"].Value;
-                        stats = JsonUtility.FromJson<PlayerStatsData>(json);
+                        stats = JsonUtility.FromJson<PlayerStatsData>(result.Data["PlayerStats"].Value);
                     }
                     catch
                     {
@@ -530,23 +543,20 @@ public class PlayFabManager : MonoBehaviour
                     new GetAccountInfoRequest { PlayFabId = playfabId },
                     accountResult =>
                     {
-                        string displayName = accountResult.AccountInfo.TitleInfo.DisplayName ?? "Unknown";
-
                         FriendData friendData = new FriendData(
                             playfabId,
-                            displayName,
+                            accountResult.AccountInfo.TitleInfo?.DisplayName ?? "Unknown",
                             stats.trophies,
-                            0,
                             stats.avatarIndex
                         );
 
                         FriendsManager.AddFriend(friendData);
                         EventManager.FireFriendAdded(friendData);
                     },
-                    error => Debug.LogError($"[PlayFabManager] GetAccountInfo error: {error.GenerateErrorReport()}")
+                    error => Debug.LogError(error.GenerateErrorReport())
                 );
             },
-            error => Debug.LogError($"[PlayFabManager] GetUserData error: {error.GenerateErrorReport()}")
+            error => Debug.LogError(error.GenerateErrorReport())
         );
     }
 
@@ -583,7 +593,8 @@ public class PlayFabManager : MonoBehaviour
                 Data = new Dictionary<string, string>
                 {
                     { "PlayerStats", JsonUtility.ToJson(statsData) }
-                }
+                },
+                Permission = UserDataPermission.Public
             },
             _ => Debug.Log("[PlayFabManager] PlayerStats saved."),
             error => Debug.LogError($"[PlayFabManager] SavePlayerStats error: {error.GenerateErrorReport()}"));

@@ -3,10 +3,6 @@ using UnityEngine;
 using UnityEngine.UI;
 using UI;
 
-/// <summary>
-/// Dialogue for adding friends by username.
-/// Shows as dialogue over FriendsView.
-/// </summary>
 public class AddFriendView : MonoBehaviour
 {
     [Header("UI References")] [SerializeField]
@@ -16,8 +12,6 @@ public class AddFriendView : MonoBehaviour
     [SerializeField] private Button closeButton;
 
     private bool _isProcessing = false;
-
-    // ── Unity ─────────────────────────────────────────────────────────────────
 
     private void Awake()
     {
@@ -33,7 +27,6 @@ public class AddFriendView : MonoBehaviour
         EventManager.OnFriendAdded += HandleFriendAdded;
         EventManager.OnAddFriendFailed += HandleAddFriendFailed;
 
-        // Clear input field
         if (usernameInputField != null)
             usernameInputField.text = "";
     }
@@ -50,8 +43,6 @@ public class AddFriendView : MonoBehaviour
         if (closeButton != null) closeButton.onClick.RemoveAllListeners();
     }
 
-    // ── Button Handlers ───────────────────────────────────────────────────────
-
     private void OnAddClicked()
     {
         if (_isProcessing) return;
@@ -60,16 +51,13 @@ public class AddFriendView : MonoBehaviour
 
         if (string.IsNullOrEmpty(username))
         {
-            EventManager.FireShowPopUp("Please enter a username.");
-            EventManager.FireShowView(ViewType.UserPopUp, showAsDialogue: true);
+            ShowPopup("Please enter a username.");
             return;
         }
 
-        // Check if trying to add self
         if (username == PlayerDataManager.DisplayName)
         {
-            EventManager.FireShowPopUp("You cannot add yourself as a friend.");
-            EventManager.FireShowView(ViewType.UserPopUp, showAsDialogue: true);
+            ShowPopup("You cannot add yourself as a friend.");
             return;
         }
 
@@ -78,6 +66,7 @@ public class AddFriendView : MonoBehaviour
             addButton.interactable = false;
 
         EventManager.FireAddFriendRequested(username);
+        EventManager.FireHideView(ViewType.AddFriend);
     }
 
     private void OnCloseClicked()
@@ -85,20 +74,14 @@ public class AddFriendView : MonoBehaviour
         EventManager.FireHideView(ViewType.AddFriend);
     }
 
-    // ── Event Handlers ────────────────────────────────────────────────────────
-
     private void HandleFriendAdded(FriendData friend)
     {
         _isProcessing = false;
         if (addButton != null)
             addButton.interactable = true;
 
-        // Show success message
-        EventManager.FireShowPopUp($"Added {friend.DisplayName} as friend!");
-        EventManager.FireShowView(ViewType.UserPopUp, showAsDialogue: true);
-
-        // Close this dialogue
         EventManager.FireHideView(ViewType.AddFriend);
+        ShowPopup("Friend added successfully!");
     }
 
     private void HandleAddFriendFailed(string reason)
@@ -107,8 +90,18 @@ public class AddFriendView : MonoBehaviour
         if (addButton != null)
             addButton.interactable = true;
 
-        // Show error
-        EventManager.FireShowPopUp(reason);
+        ShowPopup(reason);
+    }
+
+    private void ShowPopup(string message)
+    {
         EventManager.FireShowView(ViewType.UserPopUp, showAsDialogue: true);
+        StartCoroutine(ShowMessageDelayed(message));
+    }
+
+    private System.Collections.IEnumerator ShowMessageDelayed(string message)
+    {
+        yield return null;
+        EventManager.FireShowPopUp(message);
     }
 }

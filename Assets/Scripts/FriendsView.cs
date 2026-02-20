@@ -3,24 +3,18 @@ using UnityEngine.UI;
 using UI;
 using System.Collections.Generic;
 
-/// <summary>
-/// Displays friends list with add/invite functionality.
-/// Shows as dialogue over HomePage.
-/// </summary>
 public class FriendsView : MonoBehaviour
 {
     [Header("UI References")] [SerializeField]
-    private Transform friendCardContainer; // ScrollView Content
+    private Transform friendCardContainer;
 
     [SerializeField] private GameObject friendCardPrefab;
     [SerializeField] private Button addFriendButton;
     [SerializeField] private Button inviteButton;
     [SerializeField] private Button closeButton;
-    [SerializeField] private GameObject noFriendsText; // "No Friends in your list"
+    [SerializeField] private GameObject noFriendsText;
 
     private List<GameObject> _instantiatedCards = new List<GameObject>();
-
-    // ── Unity ─────────────────────────────────────────────────────────────────
 
     private void Awake()
     {
@@ -57,8 +51,6 @@ public class FriendsView : MonoBehaviour
         if (closeButton != null) closeButton.onClick.RemoveAllListeners();
     }
 
-    // ── Card Spawning ─────────────────────────────────────────────────────────
-
     private void SpawnFriendCards()
     {
         DestroyAllCards();
@@ -79,14 +71,10 @@ public class FriendsView : MonoBehaviour
 
             FriendCard card = cardObj.GetComponent<FriendCard>();
             if (card != null)
-            {
                 card.Initialize(friendData);
-            }
 
             _instantiatedCards.Add(cardObj);
         }
-
-        Debug.Log($"[FriendsView] Spawned {_instantiatedCards.Count} friend cards.");
     }
 
     private void DestroyAllCards()
@@ -100,21 +88,15 @@ public class FriendsView : MonoBehaviour
         _instantiatedCards.Clear();
     }
 
-    // ── Event Handlers ────────────────────────────────────────────────────────
-
     private void HandleFriendAdded(FriendData friend)
     {
-        // Refresh the list
         SpawnFriendCards();
     }
 
     private void HandleFriendRemoved()
     {
-        // Refresh the list
         SpawnFriendCards();
     }
-
-    // ── Button Handlers ───────────────────────────────────────────────────────
 
     private void OnAddFriendClicked()
     {
@@ -123,18 +105,13 @@ public class FriendsView : MonoBehaviour
 
     private void OnInviteClicked()
     {
-        string playerUsername = PlayerDataManager.DisplayName;
-        string appUrl =
-            "https://play.google.com/store/apps/details?id=com.yourcompany.thullamasters"; // Update with your actual URL
+        string playerName = PlayerDataManager.DisplayName;
+        string appUrl = "https://play.google.com/store/apps/details?id=com.yourcompany.thullamasters";
 
-        string message = $"Play Thulla Masters with me! My ID: {playerUsername}. Download: {appUrl}";
+        string message = $"Play Thulla Masters with me!\n\nMy Username: {playerName}\n\nDownload: {appUrl}";
         string encodedMessage = UnityEngine.Networking.UnityWebRequest.EscapeURL(message);
 
-        string whatsappUrl = $"https://wa.me/?text={encodedMessage}";
-
-        Application.OpenURL(whatsappUrl);
-
-        Debug.Log($"[FriendsView] Opening WhatsApp with invite message.");
+        Application.OpenURL($"https://wa.me/?text={encodedMessage}");
     }
 
     private void OnCloseClicked()
