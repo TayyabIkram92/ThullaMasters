@@ -9,8 +9,11 @@ namespace UI
         UserPopUp,
         GuestConfirmation,
         GameSelection,
-        Friends, // ← NEW
-        AddFriend, // ← NEW
-        DeleteFriend
+        Friends,
+        AddFriend,
+        DeleteFriend,
+        Matchmaking,
+        OnlineFriends,
+        InGame
     }
 }

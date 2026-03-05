@@ -55,6 +55,7 @@ public class PlayFabManager : MonoBehaviour
                     CreateAccount = false,
                     InfoRequestParameters = new GetPlayerCombinedInfoRequestParams
                     {
+                        GetUserAccountInfo = true,
                         GetPlayerProfile = true,
                         GetUserVirtualCurrency = true,
                         GetUserData = true
@@ -88,6 +89,7 @@ public class PlayFabManager : MonoBehaviour
                 Password = password,
                 InfoRequestParameters = new GetPlayerCombinedInfoRequestParams
                 {
+                    GetUserAccountInfo = true,
                     GetPlayerProfile = true,
                     GetUserVirtualCurrency = true,
                     GetUserData = true
@@ -150,6 +152,7 @@ public class PlayFabManager : MonoBehaviour
                 Password = password,
                 InfoRequestParameters = new GetPlayerCombinedInfoRequestParams
                 {
+                    GetUserAccountInfo = true,
                     GetPlayerProfile = true,
                     GetUserVirtualCurrency = true,
                     GetUserData = true
@@ -177,6 +180,7 @@ public class PlayFabManager : MonoBehaviour
                 CreateAccount = true,
                 InfoRequestParameters = new GetPlayerCombinedInfoRequestParams
                 {
+                    GetUserAccountInfo = true,
                     GetPlayerProfile = true,
                     GetUserVirtualCurrency = true,
                     GetUserData = true
@@ -190,6 +194,21 @@ public class PlayFabManager : MonoBehaviour
             error => { Debug.LogError($"[PlayFabManager] Guest login error: {error.GenerateErrorReport()}"); });
     }
 
+    private void HandleAwardGameWinCoins(int amount)
+    {
+        PlayFabClientAPI.AddUserVirtualCurrency(
+            new PlayFab.ClientModels.AddUserVirtualCurrencyRequest
+            {
+                VirtualCurrency = "CO",
+                Amount = amount
+            },
+            result =>
+            {
+                PlayerDataManager.UpdateCoins(result.Balance);
+                Debug.Log($"[PlayFabManager] Game win coins awarded: +{amount}. New balance: {result.Balance}");
+            },
+            error => { Debug.LogError($"[PlayFabManager] AwardGameWinCoins error: {error.GenerateErrorReport()}"); });
+    }
     // ── Parse PlayFab Data ────────────────────────────────────────────────────
 
     private IEnumerator ParseAndCachePlayerDataDelayed(GetPlayerCombinedInfoResultPayload payload, bool isAutoLogin)
@@ -241,6 +260,7 @@ public class PlayFabManager : MonoBehaviour
         }
 
         EventManager.FirePlayerDataLoaded();
+        Debug.Log($"[PlayFabManager] PlayFabId = '{playfabId}'");
     }
 
     // ── Update Profile ────────────────────────────────────────────────────────

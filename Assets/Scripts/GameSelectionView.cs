@@ -9,12 +9,11 @@ using System.Collections.Generic;
 /// </summary>
 public class GameSelectionView : MonoBehaviour
 {
-    [Header("UI References")] [SerializeField]
-    private Transform cardContainer; // Parent for instantiated cards (ScrollView Content)
-
-    [SerializeField] private GameObject cardPrefab; // GameModeCard prefab
-    [SerializeField] private Button backButton;
-    [SerializeField] private Text coinsText;
+    [Header("UI References")]
+    [SerializeField] private Transform  cardContainer;
+    [SerializeField] private GameObject cardPrefab;
+    [SerializeField] private Button     backButton;
+    [SerializeField] private Text       coinsText;
 
     private List<GameObject> _instantiatedCards = new List<GameObject>();
 
@@ -30,19 +29,15 @@ public class GameSelectionView : MonoBehaviour
     {
         EventManager.OnGameModeSelected += HandleGameModeSelected;
 
-        // Refresh coins display
         if (coinsText != null)
             coinsText.text = PlayerDataManager.Coins.ToString();
 
-        // Spawn cards
         SpawnGameModeCards();
     }
 
     private void OnDisable()
     {
         EventManager.OnGameModeSelected -= HandleGameModeSelected;
-
-        // Clean up instantiated cards
         DestroyAllCards();
     }
 
@@ -55,7 +50,6 @@ public class GameSelectionView : MonoBehaviour
 
     private void SpawnGameModeCards()
     {
-        // Clean up existing cards first
         DestroyAllCards();
 
         if (!GameModeManager.IsInitialized)
@@ -66,23 +60,16 @@ public class GameSelectionView : MonoBehaviour
             return;
         }
 
-        // Unsubscribe if we were waiting
         EventManager.OnGameModesFetched -= SpawnGameModeCards;
 
-        // Instantiate a card for each game mode
         foreach (var modeData in GameModeManager.AvailableModes)
         {
             GameObject cardObj = Instantiate(cardPrefab, cardContainer);
-
-            GameModeCard card = cardObj.GetComponent<GameModeCard>();
+            GameModeCard card  = cardObj.GetComponent<GameModeCard>();
             if (card != null)
-            {
                 card.Initialize(modeData);
-            }
             else
-            {
                 Debug.LogError("[GameSelectionView] CardPrefab missing GameModeCard component!");
-            }
 
             _instantiatedCards.Add(cardObj);
         }
@@ -93,10 +80,7 @@ public class GameSelectionView : MonoBehaviour
     private void DestroyAllCards()
     {
         foreach (var card in _instantiatedCards)
-        {
-            if (card != null)
-                Destroy(card);
-        }
+            if (card != null) Destroy(card);
 
         _instantiatedCards.Clear();
     }
@@ -105,23 +89,22 @@ public class GameSelectionView : MonoBehaviour
 
     private void HandleGameModeSelected(GameModeData modeData)
     {
-        // Check if user has enough coins
+        // Check coins
         if (PlayerDataManager.Coins < modeData.EntryFee)
         {
-            Debug.LogWarning(
-                $"[GameSelectionView] Not enough coins. Need: {modeData.EntryFee}, Have: {PlayerDataManager.Coins}");
-
+            Debug.LogWarning($"[GameSelectionView] Not enough coins. Need: {modeData.EntryFee}, Have: {PlayerDataManager.Coins}");
             EventManager.FireShowView(ViewType.UserPopUp, showAsDialogue: true);
             EventManager.FireShowPopUp(
                 $"You need {modeData.EntryFee} coins to enter this game mode.\nYou have {PlayerDataManager.Coins} coins.");
             return;
         }
 
-        // Navigate to matchmaking/room creation (placeholder for now)
-        Debug.Log($"[GameSelectionView] Navigating to matchmaking with entry fee: {modeData.EntryFee}");
+        // Store the selected mode FIRST so MatchmakingView can read it in OnEnable
+        // This must happen before FireShowView — FireShowView calls SetActive(true)
+        // which triggers OnEnable on MatchmakingView immediately
+        GameModeManager.SetSelectedMode(modeData);
 
-        // TODO: Navigate to Matchmaking/Room view
-        // EventManager.FireShowView(ViewType.Matchmaking);
+        EventManager.FireShowView(ViewType.Matchmaking);
     }
 
     private void OnBackClicked()
