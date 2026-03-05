@@ -33,13 +33,13 @@ public class GameManager : MonoBehaviour
 
     // ── State ─────────────────────────────────────────────────────────────────
 
-    private RoomData _room;
-    private GameState _gs;
-    private bool _isHost;
-    private bool _gameActive;
-    private bool _myTurnActive; // true only while it's local player's turn
-    private Coroutine _turnTimerCoroutine;
-    private Coroutine _botCoroutine;
+    private RoomData   _room;
+    private GameState  _gs;
+    private bool       _isHost;
+    private bool       _gameActive;
+    private bool       _myTurnActive;       // true only while it's local player's turn
+    private Coroutine  _turnTimerCoroutine;
+    private Coroutine  _botCoroutine;
     private ListenerRegistration _listener;
 
     // Local player's hand (kept in sync with _gs.hands[localId])
@@ -49,19 +49,14 @@ public class GameManager : MonoBehaviour
 
     private void Awake()
     {
-        if (Instance != null && Instance != this)
-        {
-            Destroy(gameObject);
-            return;
-        }
-
+        if (Instance != null && Instance != this) { Destroy(gameObject); return; }
         Instance = this;
     }
 
     private void OnEnable()
     {
-        EventManager.OnGameReady += HandleGameReady;
-        EventManager.OnLocalCardPlayed += HandleLocalCardPlayed;
+        EventManager.OnGameReady          += HandleGameReady;
+        EventManager.OnLocalCardPlayed    += HandleLocalCardPlayed;
         EventManager.OnStealHandRequested += HandleStealHand;
         EventManager.OnShootoutCardChosen += HandleShootoutCardChosen;
         EventManager.OnLeaveGameRequested += HandleLeaveGame;
@@ -69,8 +64,8 @@ public class GameManager : MonoBehaviour
 
     private void OnDisable()
     {
-        EventManager.OnGameReady -= HandleGameReady;
-        EventManager.OnLocalCardPlayed -= HandleLocalCardPlayed;
+        EventManager.OnGameReady          -= HandleGameReady;
+        EventManager.OnLocalCardPlayed    -= HandleLocalCardPlayed;
         EventManager.OnStealHandRequested -= HandleStealHand;
         EventManager.OnShootoutCardChosen -= HandleShootoutCardChosen;
         EventManager.OnLeaveGameRequested -= HandleLeaveGame;
@@ -85,8 +80,8 @@ public class GameManager : MonoBehaviour
     /// </summary>
     private void HandleGameReady(List<CardData> localHand, List<SlotData> seatedPlayers)
     {
-        _room = InGameManager.Instance != null ? GetCurrentRoom() : null;
-        _isHost = _room != null && _room.hostId == PlayerDataManager.PlayFabId;
+        _room    = InGameManager.Instance != null ? GetCurrentRoom() : null;
+        _isHost  = _room != null && _room.hostId == PlayerDataManager.PlayFabId;
 
         // Cache local hand as string codes
         _myHand.Clear();
@@ -108,14 +103,10 @@ public class GameManager : MonoBehaviour
     private void InitialiseGameState()
     {
         _room = GetCurrentRoom();
-        if (_room == null)
-        {
-            Debug.LogError("[GameManager] Room is null on init.");
-            return;
-        }
+        if (_room == null) { Debug.LogError("[GameManager] Room is null on init."); return; }
 
         _gs = new GameState();
-        _gs.phase = GameState.PhasePlaying;
+        _gs.phase    = GameState.PhasePlaying;
         _gs.roundNumber = 1;
 
         // activePlayers = all players in room order
@@ -139,8 +130,8 @@ public class GameManager : MonoBehaviour
         }
 
         _gs.currentPlayerIndex = startIndex;
-        _gs.leadSuit = "";
-        _gs.turnStartTime = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        _gs.leadSuit           = "";
+        _gs.turnStartTime      = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
         WriteGameState(() =>
         {
@@ -175,9 +166,9 @@ public class GameManager : MonoBehaviour
                 // Only process if something meaningful changed
                 bool turnChanged = _gs == null ||
                                    newGs.currentPlayerIndex != _gs.currentPlayerIndex ||
-                                   newGs.roundNumber != _gs.roundNumber ||
-                                   newGs.phase != _gs.phase ||
-                                   newGs.cardsInPlay.Count != _gs.cardsInPlay.Count;
+                                   newGs.roundNumber        != _gs.roundNumber        ||
+                                   newGs.phase              != _gs.phase              ||
+                                   newGs.cardsInPlay.Count  != _gs.cardsInPlay.Count;
 
                 _gs = newGs;
 
@@ -217,14 +208,10 @@ public class GameManager : MonoBehaviour
         StopBotCoroutine();
 
         if (_gs == null || !_gameActive) return;
-        if (_gs.phase == GameState.PhaseShootout)
-        {
-            ProcessShootoutTurn();
-            return;
-        }
+        if (_gs.phase == GameState.PhaseShootout) { ProcessShootoutTurn(); return; }
 
         string currentId = _gs.CurrentPlayerId;
-        string localId = PlayerDataManager.PlayFabId;
+        string localId   = PlayerDataManager.PlayFabId;
 
         // Start local countdown (everyone does this — purely visual)
         float remaining = _gs.SecondsRemaining(GameState.TurnSeconds);
@@ -255,7 +242,7 @@ public class GameManager : MonoBehaviour
         if (!_gameActive) yield break;
 
         string currentId = _gs?.CurrentPlayerId ?? "";
-        string localId = PlayerDataManager.PlayFabId;
+        string localId   = PlayerDataManager.PlayFabId;
 
         if (currentId == localId && _myTurnActive)
         {
@@ -299,11 +286,19 @@ public class GameManager : MonoBehaviour
 
     private string ChooseAutoCard(string playerId, List<string> hand)
     {
-        // Round 1 leader must play Ace of Spades
+        // Round 1 leader MUST play Ace of Spades
         if (_gs.roundNumber == 1 && _gs.cardsInPlay.Count == 0 && hand.Contains("AS"))
             return "AS";
 
-        // No lead suit yet (player is leading) — play first card in hand
+        // Round 1 followers: must play a spade if they have one.
+        // If no spade, play any card — goes to discard regardless (Special Rule 1).
+        if (_gs.roundNumber == 1 && _gs.cardsInPlay.Count > 0)
+        {
+            var spades = hand.FindAll(c => GetSuit(c) == "S");
+            return spades.Count > 0 ? spades[0] : hand[0];
+        }
+
+        // No lead suit set (player is leading) — play first card in hand
         if (string.IsNullOrEmpty(_gs.leadSuit))
             return hand[0];
 
@@ -324,8 +319,30 @@ public class GameManager : MonoBehaviour
         if (_gs?.CurrentPlayerId != PlayerDataManager.PlayFabId) return;
         if (!_myHand.Contains(cardCode)) return;
 
-        // Validate: must follow suit if possible (and not leading)
-        if (!string.IsNullOrEmpty(_gs.leadSuit))
+        // Round 1 first card: ONLY Ace of Spades is valid
+        if (_gs.roundNumber == 1 && _gs.cardsInPlay.Count == 0)
+        {
+            if (cardCode != "AS")
+            {
+                Debug.LogWarning("[GameManager] Round 1 leader must play Ace of Spades!");
+                return;
+            }
+        }
+
+        // Round 1 followers: must play a spade if they have one
+        if (_gs.roundNumber == 1 && _gs.cardsInPlay.Count > 0)
+        {
+            bool hasSpade = _myHand.Exists(c => GetSuit(c) == "S");
+            if (hasSpade && GetSuit(cardCode) != "S")
+            {
+                Debug.LogWarning("[GameManager] Round 1: must play a spade!");
+                return;
+            }
+            // If no spade, any card is valid — goes to discard (Special Rule 1)
+        }
+
+        // Normal rounds: must follow lead suit if possible
+        if (_gs.roundNumber > 1 && !string.IsNullOrEmpty(_gs.leadSuit))
         {
             bool hasLeadSuit = _myHand.Exists(c => GetSuit(c) == _gs.leadSuit);
             if (hasLeadSuit && GetSuit(cardCode) != _gs.leadSuit)
@@ -348,8 +365,8 @@ public class GameManager : MonoBehaviour
         if (_gs.CurrentPlayerId != PlayerDataManager.PlayFabId) return;
         if (!string.IsNullOrEmpty(_gs.leadSuit)) return; // can only steal when leading
 
-        string localId = PlayerDataManager.PlayFabId;
-        string leftId = GetNextActivePlayerLeft(localId);
+        string localId    = PlayerDataManager.PlayFabId;
+        string leftId     = GetNextActivePlayerLeft(localId);
 
         if (string.IsNullOrEmpty(leftId)) return;
         if (!_gs.hands.ContainsKey(leftId) || _gs.hands[leftId].Count == 0) return;
@@ -359,7 +376,7 @@ public class GameManager : MonoBehaviour
         _gs.hands[leftId].Clear();
         _gs.hands[localId].AddRange(stolen);
         _myHand = new List<string>(_gs.hands[localId]);
-        EventManager.FireLocalHandUpdated(new List<string>(_myHand));
+        EventManager.FireLocalHandUpdated(new List<string>(_myHand), _gs);
 
         // Mark left player as winner
         if (!_gs.winners.Contains(leftId))
@@ -403,7 +420,7 @@ public class GameManager : MonoBehaviour
         if (_gs?.phase != GameState.PhaseShootout) yield break;
 
         string drawerId = _gs.shootoutDrawerId;
-        string localId = PlayerDataManager.PlayFabId;
+        string localId  = PlayerDataManager.PlayFabId;
 
         if (drawerId == localId)
             ExecuteShootoutDraw(localId);
@@ -429,18 +446,14 @@ public class GameManager : MonoBehaviour
         // Find the other active player
         string responderId = "";
         foreach (var pid in _gs.activePlayers)
-            if (pid != drawerId)
-            {
-                responderId = pid;
-                break;
-            }
+            if (pid != drawerId) { responderId = pid; break; }
 
         if (string.IsNullOrEmpty(responderId)) return;
         if (!_gs.hands.ContainsKey(responderId) || _gs.hands[responderId].Count == 0) return;
 
         // Pick random card from responder's hand
         var responderHand = _gs.hands[responderId];
-        int idx = UnityEngine.Random.Range(0, responderHand.Count);
+        int idx  = UnityEngine.Random.Range(0, responderHand.Count);
         string drawnCard = responderHand[idx];
 
         // Remove from responder, add to drawer
@@ -452,17 +465,17 @@ public class GameManager : MonoBehaviour
         if (drawerId == PlayerDataManager.PlayFabId)
         {
             _myHand = new List<string>(_gs.hands[drawerId]);
-            EventManager.FireLocalHandUpdated(new List<string>(_myHand));
+            EventManager.FireLocalHandUpdated(new List<string>(_myHand), _gs);
         }
 
         // Now drawer leads with that drawn card
         // Switch phase back to playing, drawer is current player, clear leadSuit
-        _gs.phase = GameState.PhasePlaying;
-        _gs.leadSuit = "";
+        _gs.phase              = GameState.PhasePlaying;
+        _gs.leadSuit           = "";
         _gs.cardsInPlay.Clear();
         _gs.currentPlayerIndex = _gs.activePlayers.IndexOf(drawerId);
-        _gs.turnStartTime = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-        _gs.shootoutDrawerId = "";
+        _gs.turnStartTime      = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        _gs.shootoutDrawerId   = "";
 
         // Drawer must play the drawn card
         ExecuteMove(drawerId, drawnCard);
@@ -496,7 +509,13 @@ public class GameManager : MonoBehaviour
         // Remove card from hand
         _gs.hands[playerId].Remove(cardCode);
         if (playerId == PlayerDataManager.PlayFabId)
+        {
             _myHand.Remove(cardCode);
+            // Immediately update view — this removes the card GO from MyCards.
+            // For thulla/steal/shootout, FireLocalHandUpdated fires again later
+            // with the full new hand including picked-up cards.
+            EventManager.FireLocalHandUpdated(new List<string>(_myHand), _gs);
+        }
 
         // Set lead suit on first card of round
         if (_gs.cardsInPlay.Count == 0)
@@ -545,22 +564,27 @@ public class GameManager : MonoBehaviour
     /// </summary>
     private void ResolveRound(bool lastPlayerRanOut)
     {
-        // Find highest card of lead suit
-        string winnerId = "";
-        int highestRank = -1;
+        string roundLeadSuit = _gs.leadSuit;
+
+        // Find highest card of lead suit — scan BEFORE clearing
+        string winnerId    = "";
+        int    highestRank = -1;
 
         foreach (var pc in _gs.cardsInPlay)
         {
-            if (GetSuit(pc.card) != _gs.leadSuit) continue;
+            if (GetSuit(pc.card) != roundLeadSuit) continue;
             int rank = GetRankValue(pc.card);
             if (rank > highestRank)
             {
                 highestRank = rank;
-                winnerId = pc.playerId;
+                winnerId    = pc.playerId;
             }
         }
 
         Debug.Log($"[GameManager] Round {_gs.roundNumber} complete. Winner of round: {winnerId}");
+
+        // Save snapshot for Special Rule 3 BEFORE clearing cardsInPlay
+        var playedSnapshot = new List<PlayedCard>(_gs.cardsInPlay);
 
         // Discard all cards
         _gs.cardsInPlay.Clear();
@@ -570,17 +594,24 @@ public class GameManager : MonoBehaviour
         // Check for players who ran out of cards
         CheckForNewWinners();
 
-        // Special Rule 3: if round winner has no cards, skip to their left
-        if (!string.IsNullOrEmpty(winnerId))
+        // Special Rule 3: if round winner just ran out of cards,
+        // the player with the NEXT HIGHEST lead-suit card from this round leads.
+        if (!string.IsNullOrEmpty(winnerId) &&
+            _gs.hands.ContainsKey(winnerId) && _gs.hands[winnerId].Count == 0)
         {
-            if (_gs.hands.ContainsKey(winnerId) && _gs.hands[winnerId].Count == 0)
+            string nextLeaderId = GetSecondHighestSuitCardPlayer(winnerId, roundLeadSuit, playedSnapshot);
+            if (!string.IsNullOrEmpty(nextLeaderId))
+                winnerId = nextLeaderId;
+            else
             {
-                // Winner ran out — player to their left leads
-                int winnerIdx = _gs.activePlayers.IndexOf(winnerId);
-                if (winnerIdx >= 0)
-                    winnerId = GetPlayerIdAt((winnerIdx + 1) % _gs.activePlayers.Count);
+                // No other suit cards found — first remaining active player leads
+                if (_gs.activePlayers.Count > 0)
+                    winnerId = _gs.activePlayers[0];
             }
         }
+
+        // Check shootout BEFORE game over
+        if (CheckShootout()) return;
 
         // Check game over
         if (CheckGameOver()) return;
@@ -602,8 +633,8 @@ public class GameManager : MonoBehaviour
     /// </summary>
     private void ResolveOutOfSuit()
     {
-        string pickupId = "";
-        int highestRank = -1;
+        string pickupId  = "";
+        int    highestRank = -1;
 
         foreach (var pc in _gs.cardsInPlay)
         {
@@ -612,7 +643,7 @@ public class GameManager : MonoBehaviour
             if (rank > highestRank)
             {
                 highestRank = rank;
-                pickupId = pc.playerId;
+                pickupId    = pc.playerId;
             }
         }
 
@@ -638,10 +669,14 @@ public class GameManager : MonoBehaviour
         if (pickupId == PlayerDataManager.PlayFabId)
         {
             _myHand = new List<string>(_gs.hands[pickupId]);
-            EventManager.FireLocalHandUpdated(new List<string>(_myHand));
+            EventManager.FireLocalHandUpdated(new List<string>(_myHand), _gs);
         }
 
         CheckForNewWinners();
+
+        // Check shootout before game over
+        if (CheckShootout()) return;
+
         if (CheckGameOver()) return;
 
         _gs.turnStartTime = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
@@ -663,11 +698,9 @@ public class GameManager : MonoBehaviour
                     _gs.winners.Add(pid);
                     Debug.Log($"[GameManager] {pid} has won!");
                 }
-
                 toRemove.Add(pid);
             }
         }
-
         foreach (var pid in toRemove)
             _gs.activePlayers.Remove(pid);
 
@@ -714,17 +747,14 @@ public class GameManager : MonoBehaviour
         string zeroCardId = "";
         foreach (var pid in _gs.activePlayers)
             if (_gs.hands.ContainsKey(pid) && _gs.hands[pid].Count == 0)
-            {
-                zeroCardId = pid;
-                break;
-            }
+            { zeroCardId = pid; break; }
 
         if (string.IsNullOrEmpty(zeroCardId)) return false;
 
         // The player with 0 cards becomes the drawer
-        _gs.phase = GameState.PhaseShootout;
+        _gs.phase            = GameState.PhaseShootout;
         _gs.shootoutDrawerId = zeroCardId;
-        _gs.turnStartTime = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        _gs.turnStartTime    = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
         Debug.Log($"[GameManager] Shootout! Drawer: {zeroCardId}");
         WriteGameStateAndProcess();
@@ -773,6 +803,45 @@ public class GameManager : MonoBehaviour
     private bool IsBot(string id) =>
         id != null && id.StartsWith("BOT_");
 
+    /// <summary>
+    /// Special Rule 3 helper: finds the player who played the second-highest
+    /// card of the lead suit in the current round's cardsInPlay snapshot.
+    /// Used when the round winner ran out of cards.
+    /// excludeId = the winner (who just ran out, already removed from activePlayers).
+    /// Returns "" if no other suit card was played.
+    /// </summary>
+    /// <summary>
+    /// Special Rule 3: from a snapshot of this round's played cards,
+    /// find the player (excluding the winner who ran out) with the highest
+    /// lead-suit card who is still an active player.
+    /// Uses a pre-clear snapshot since cardsInPlay is cleared before this runs.
+    /// </summary>
+    private string GetSecondHighestSuitCardPlayer(
+        string excludeId, string leadSuit, List<PlayedCard> snapshot)
+    {
+        string bestId   = "";
+        int    bestRank = -1;
+
+        foreach (var pc in snapshot)
+        {
+            if (pc.playerId == excludeId) continue;
+            if (GetSuit(pc.card) != leadSuit) continue;
+
+            int rank = GetRankValue(pc.card);
+            if (rank > bestRank)
+            {
+                bestRank = rank;
+                bestId   = pc.playerId;
+            }
+        }
+
+        // Only valid if that player is still active (has cards left)
+        if (!string.IsNullOrEmpty(bestId) && _gs.activePlayers.Contains(bestId))
+            return bestId;
+
+        return "";
+    }
+
     private string GetSuit(string code)
     {
         if (string.IsNullOrEmpty(code)) return "";
@@ -789,11 +858,11 @@ public class GameManager : MonoBehaviour
         string rankStr = code.Substring(0, code.Length - 1);
         switch (rankStr)
         {
-            case "A": return 14;
-            case "K": return 13;
-            case "Q": return 12;
-            case "J": return 11;
-            default: return int.TryParse(rankStr, out int v) ? v : 0;
+            case "A":  return 14;
+            case "K":  return 13;
+            case "Q":  return 12;
+            case "J":  return 11;
+            default:   return int.TryParse(rankStr, out int v) ? v : 0;
         }
     }
 
@@ -806,11 +875,7 @@ public class GameManager : MonoBehaviour
     private void AdjustCurrentIndexAfterRemoval()
     {
         if (_gs.activePlayers.Count == 0)
-        {
-            _gs.currentPlayerIndex = 0;
-            return;
-        }
-
+        { _gs.currentPlayerIndex = 0; return; }
         _gs.currentPlayerIndex = _gs.currentPlayerIndex % _gs.activePlayers.Count;
     }
 
@@ -841,7 +906,6 @@ public class GameManager : MonoBehaviour
             if (_gs.activePlayers.Contains(candidate) && candidate != fromId)
                 return candidate;
         }
-
         return "";
     }
 
@@ -849,11 +913,7 @@ public class GameManager : MonoBehaviour
 
     private void WriteGameState(Action onComplete = null)
     {
-        if (_room == null)
-        {
-            onComplete?.Invoke();
-            return;
-        }
+        if (_room == null) { onComplete?.Invoke(); return; }
 
         var update = new Dictionary<string, object>
         {
@@ -895,7 +955,7 @@ public class GameManager : MonoBehaviour
 
     private void HandleLeaveGame()
     {
-        _gameActive = false;
+        _gameActive   = false;
         _myTurnActive = false;
         StopAllCoroutines();
         StopListener();

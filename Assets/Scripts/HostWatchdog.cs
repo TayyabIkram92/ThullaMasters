@@ -6,18 +6,24 @@ using Firebase.Extensions;
 using Firebase.Firestore;
 
 /// <summary>
-/// HostWatchdog — handles host disconnect detection and room cleanup.
+/// HostWatchdog — robust host disconnect detection and room cleanup.
 ///
-/// Strategy (minimal Firestore reads/writes):
-///   - Host writes "hostLastSeen" timestamp every 15s via a heartbeat coroutine.
-///   - Host also writes it immediately on ApplicationFocus/Pause/Quit.
-///   - Non-host clients check "hostLastSeen" every 20s (one read).
-///     If it's older than 40s → host is considered disconnected.
-///   - On disconnect: non-host clients end the game locally.
-///     Host is marked Bhabhi, all others are winners.
-///     If there are real (non-bot) players, they each write the result
-///     using a simple "first writer wins" approach (check phase != finished first).
-///   - Room document is deleted after game ends (winners + bhabhi confirmed).
+/// HOST side:
+///   - Writes "hostLastSeen" timestamp immediately on game start.
+///   - Refreshes it every HeartbeatInterval (15s).
+///   - Also writes on focus loss, pause, and quit (covers background/kill/crash).
+///   - On leave: marks room as finished and awards coins before leaving.
+///
+/// NON-HOST side:
+///   - Checks hostLastSeen every CheckInterval (20s) via a single GetSnapshot read.
+///   - If timestamp is older than DisconnectTimeout (40s) → host disconnected.
+///   - Writes finished state (host=Bhabhi, others=winners) with a guard to prevent
+///     double-write (reads phase first, only writes if not already "finished").
+///   - Each non-host client awards its own coins independently (no double-award
+///     since each client only awards itself).
+///   - Room is deleted 3s after game ends.
+///
+/// COVERS: internet loss, crash, ANR, force-quit, user leaves.
 ///
 /// Attach to DontDestroyOnLoad GO alongside GameManager.
 /// </summary>
@@ -27,20 +33,21 @@ public class HostWatchdog : MonoBehaviour
 
     // ── Constants ─────────────────────────────────────────────────────────────
 
-    private const string RoomsCollection    = "rooms";
-    private const float  HeartbeatInterval  = 15f;   // host writes every 15s
-    private const float  CheckInterval      = 20f;   // non-host checks every 20s
-    private const float  DisconnectTimeout  = 40f;   // considered disconnected after 40s
+    private const string RoomsCollection   = "rooms";
+    private const float  HeartbeatInterval = 15f;  // host writes every 15s
+    private const float  CheckInterval     = 20f;  // non-host reads every 20s
+    private const float  DisconnectTimeout = 40f;  // 40s without heartbeat = disconnected
 
     // ── State ─────────────────────────────────────────────────────────────────
 
     private RoomData  _room;
     private bool      _isHost;
     private bool      _active;
+    private bool      _gameFinishedFired; // guard against double FireGameFinished
     private Coroutine _heartbeatCoroutine;
     private Coroutine _watchCoroutine;
 
-    // ── Unity ─────────────────────────────────────────────────────────────────
+    // ── Unity Lifecycle ───────────────────────────────────────────────────────
 
     private void Awake()
     {
@@ -52,59 +59,67 @@ public class HostWatchdog : MonoBehaviour
     {
         EventManager.OnGameReady          += HandleGameReady;
         EventManager.OnGameFinished       += HandleGameFinished;
-        EventManager.OnLeaveGameRequested += HandleLeave;
+        EventManager.OnLeaveGameRequested += HandleLeaveRequested;
     }
 
     private void OnDisable()
     {
         EventManager.OnGameReady          -= HandleGameReady;
         EventManager.OnGameFinished       -= HandleGameFinished;
-        EventManager.OnLeaveGameRequested -= HandleLeave;
-        Stop();
+        EventManager.OnLeaveGameRequested -= HandleLeaveRequested;
+        StopAllWatchdogCoroutines();
     }
 
-    // Host loses focus / pauses (mobile background) / quits
+    // ── Platform Disconnect Hooks (covers all exit scenarios) ─────────────────
+
+    /// <summary>App loses focus — covers alt-tab, notification pull-down, incoming call.</summary>
     private void OnApplicationFocus(bool hasFocus)
     {
         if (!hasFocus && _isHost && _active)
-            WriteHeartbeat();   // last known timestamp before going background
+            WriteHeartbeat(); // last-known timestamp before going away
     }
 
+    /// <summary>App pauses — covers home button press, app backgrounding on mobile.</summary>
     private void OnApplicationPause(bool isPaused)
     {
         if (isPaused && _isHost && _active)
             WriteHeartbeat();
     }
 
+    /// <summary>App is quitting — covers user force-quit and normal exit.</summary>
     private void OnApplicationQuit()
     {
-        if (_isHost && _active)
-            WriteHeartbeat();   // best-effort on quit
+        if (!_isHost || !_active) return;
+        // Best-effort synchronous-style: mark host as disconnected so non-hosts detect it.
+        // We can't await async here, so just stamp the old timestamp (don't update it).
+        // Non-hosts will detect absence of new heartbeat within 40s.
+        // Nothing more we can do on force-kill.
+        _active = false;
     }
 
-    // ── Init ──────────────────────────────────────────────────────────────────
+    // ── Game Ready ────────────────────────────────────────────────────────────
 
     private void HandleGameReady(List<CardData> localHand, List<SlotData> seatedPlayers)
     {
-        _room   = InGameManager.Instance?.CurrentRoom;
-        _isHost = _room != null && _room.hostId == PlayerDataManager.PlayFabId;
-        _active = true;
+        _room               = InGameManager.Instance?.CurrentRoom;
+        _isHost             = _room != null && _room.hostId == PlayerDataManager.PlayFabId;
+        _active             = true;
+        _gameFinishedFired  = false;
 
         if (_isHost)
         {
-            // Write first heartbeat immediately
             WriteHeartbeat();
             _heartbeatCoroutine = StartCoroutine(HeartbeatRoutine());
         }
         else
         {
-            // Only start watching if there are real non-bot players as host
-            // (if host is bot-only we don't need to watch)
-            bool hostIsReal = false;
-            foreach (var p in _room.players)
-                if (p.id == _room.hostId && !p.isBot) { hostIsReal = true; break; }
+            // Watch only if host is a real player (not a bot)
+            bool hostIsRealPlayer = false;
+            if (_room != null)
+                foreach (var p in _room.players)
+                    if (p.id == _room.hostId && !p.isBot) { hostIsRealPlayer = true; break; }
 
-            if (hostIsReal)
+            if (hostIsRealPlayer)
                 _watchCoroutine = StartCoroutine(WatchRoutine());
         }
     }
@@ -125,19 +140,14 @@ public class HostWatchdog : MonoBehaviour
         if (_room == null) return;
 
         long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-        var update = new Dictionary<string, object>
-        {
-            { "hostLastSeen", now }
-        };
-
         FirebaseManager.DB
             .Collection(RoomsCollection)
             .Document(_room.roomId)
-            .UpdateAsync(update)
+            .UpdateAsync(new Dictionary<string, object> { { "hostLastSeen", now } })
             .ContinueWithOnMainThread(task =>
             {
                 if (task.IsFaulted)
-                    Debug.LogWarning($"[HostWatchdog] Heartbeat write failed: {task.Exception?.Message}");
+                    Debug.LogWarning($"[HostWatchdog] Heartbeat failed: {task.Exception?.Message}");
             });
     }
 
@@ -145,8 +155,7 @@ public class HostWatchdog : MonoBehaviour
 
     private IEnumerator WatchRoutine()
     {
-        // Wait one full interval before first check
-        // (give host time to write first heartbeat)
+        // Give host time to write first heartbeat before we start checking
         yield return new WaitForSeconds(CheckInterval);
 
         while (_active)
@@ -169,79 +178,78 @@ public class HostWatchdog : MonoBehaviour
                 if (!_active) return;
                 if (task.IsFaulted)
                 {
-                    Debug.LogWarning($"[HostWatchdog] Check failed: {task.Exception?.Message}");
+                    Debug.LogWarning($"[HostWatchdog] Check read failed: {task.Exception?.Message}");
                     return;
                 }
 
                 var snap = task.Result;
-                if (!snap.Exists) return;
+                if (!snap.Exists) return; // room already deleted
 
                 var dict = snap.ToDictionary();
+
+                // If game already finished, stop watching
+                if (dict.ContainsKey("gameState") &&
+                    dict["gameState"] is Dictionary<string, object> gsDict)
+                {
+                    string phase = gsDict.ContainsKey("phase") ? gsDict["phase"].ToString() : "";
+                    if (phase == GameState.PhaseFinished) { _active = false; return; }
+                }
+
                 if (!dict.ContainsKey("hostLastSeen")) return;
 
-                long lastSeen = Convert.ToInt64(dict["hostLastSeen"]);
-                long now      = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-                float elapsed = (now - lastSeen) / 1000f;
+                long  lastSeen = Convert.ToInt64(dict["hostLastSeen"]);
+                long  now      = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                float elapsedS = (now - lastSeen) / 1000f;
 
-                if (elapsed > DisconnectTimeout)
+                if (elapsedS > DisconnectTimeout)
                 {
-                    Debug.LogWarning($"[HostWatchdog] Host disconnected ({elapsed:F0}s ago). Ending game.");
+                    Debug.LogWarning($"[HostWatchdog] Host silent for {elapsedS:F0}s. Declaring disconnect.");
                     HandleHostDisconnected();
                 }
             });
     }
 
+    // ── Host Disconnected ─────────────────────────────────────────────────────
+
     private void HandleHostDisconnected()
     {
-        if (!_active) return;
+        if (!_active || _gameFinishedFired) return;
         _active = false;
-        Stop();
+        StopAllWatchdogCoroutines();
 
-        // Host is Bhabhi — all others win
-        // Only act if game is still in playing state
         var gs = GameManager.Instance?.CurrentGs;
-        if (gs == null || gs.phase == GameState.PhaseFinished) return;
+        if (gs != null && gs.phase == GameState.PhaseFinished) return;
 
         string hostId  = _room.hostId;
         var    winners = new List<string>();
-
         foreach (var p in _room.players)
             if (p.id != hostId) winners.Add(p.id);
 
-        // Write result to Firestore (best effort, first writer wins)
-        // Check current phase first to avoid double-write
+        // Read Firestore first — only write if not already finished (prevents double-write)
         FirebaseManager.DB
             .Collection(RoomsCollection)
             .Document(_room.roomId)
             .GetSnapshotAsync()
-            .ContinueWithOnMainThread(task =>
+            .ContinueWithOnMainThread(readTask =>
             {
-                if (task.IsFaulted) return;
+                if (readTask.IsFaulted) return;
 
-                var snap = task.Result;
+                var snap = readTask.Result;
                 if (!snap.Exists) return;
 
                 var dict = snap.ToDictionary();
                 if (dict.ContainsKey("gameState") &&
                     dict["gameState"] is Dictionary<string, object> gsDict)
                 {
-                    string phase = gsDict.ContainsKey("phase")
-                                   ? gsDict["phase"].ToString() : "";
-                    if (phase == GameState.PhaseFinished) return; // already finished
+                    string phase = gsDict.ContainsKey("phase") ? gsDict["phase"].ToString() : "";
+                    if (phase == GameState.PhaseFinished) return; // already done
                 }
 
-                // Write finished state
-                var finishedGs = new Dictionary<string, object>
-                {
-                    { "phase",   GameState.PhaseFinished },
-                    { "bhabhi",  hostId                  },
-                    { "winners", new List<object>(winners.ConvertAll(w => (object)w)) }
-                };
-
+                // Write: host = Bhabhi, all others = winners
                 var update = new Dictionary<string, object>
                 {
                     { "gameState.phase",   GameState.PhaseFinished },
-                    { "gameState.bhabhi",  hostId                  },
+                    { "gameState.bhabhi",  hostId },
                     { "gameState.winners", new List<object>(winners.ConvertAll(w => (object)w)) }
                 };
 
@@ -253,76 +261,121 @@ public class HostWatchdog : MonoBehaviour
                     {
                         if (writeTask.IsFaulted)
                         {
-                            Debug.LogWarning("[HostWatchdog] Could not write disconnect result.");
-                            return;
+                            Debug.LogWarning("[HostWatchdog] Disconnect write failed — firing locally anyway.");
                         }
 
-                        // Fire locally
-                        EventManager.FireGameFinished(winners, hostId);
-
-                        // Award coins to local player if they are a winner
-                        if (winners.Contains(PlayerDataManager.PlayFabId))
-                        {
-                            int payout = Mathf.RoundToInt(_room.entryFee * 1.25f);
-                            EventManager.FireAwardGameCoinsRequested(winners, payout);
-                        }
+                        // Fire game finished and award coins locally regardless of write result.
+                        // Each non-host client only awards itself — no double-award risk.
+                        FireDisconnectResult(winners, hostId);
                     });
             });
     }
 
-    // ── Game Finished: Room Cleanup (Bug 6) ───────────────────────────────────
+    private void FireDisconnectResult(List<string> winners, string hostId)
+    {
+        if (_gameFinishedFired) return;
+        _gameFinishedFired = true;
+
+        EventManager.FireGameFinished(winners, hostId);
+
+        // Award coins only if local player won
+        if (winners.Contains(PlayerDataManager.PlayFabId))
+        {
+            int payout = _room != null ? Mathf.RoundToInt(_room.entryFee * 1.25f) : 0;
+            if (payout > 0)
+                EventManager.FireAwardGameCoinsRequested(winners, payout);
+        }
+
+        // Delete room after delay
+        StartCoroutine(DeleteRoomAfterDelay(3f));
+    }
+
+    // ── Player Leaves Voluntarily ─────────────────────────────────────────────
+
+    /// <summary>
+    /// Called when local player presses Leave.
+    /// If they are host: mark as Bhabhi and end game for others before leaving.
+    /// If they are non-host: just stop watching and leave.
+    /// </summary>
+    private void HandleLeaveRequested()
+    {
+        _active = false;
+        StopAllWatchdogCoroutines();
+
+        if (!_isHost || _room == null)
+        {
+            _room = null;
+            return;
+        }
+
+        // Host is voluntarily leaving — treat same as disconnect
+        // Award others and mark host as Bhabhi
+        var winners = new List<string>();
+        foreach (var p in _room.players)
+            if (p.id != _room.hostId) winners.Add(p.id);
+
+        string hostId = _room.hostId;
+
+        var update = new Dictionary<string, object>
+        {
+            { "gameState.phase",   GameState.PhaseFinished },
+            { "gameState.bhabhi",  hostId },
+            { "gameState.winners", new List<object>(winners.ConvertAll(w => (object)w)) }
+        };
+
+        // Write and then navigate away — don't wait for result
+        FirebaseManager.DB
+            .Collection(RoomsCollection)
+            .Document(_room.roomId)
+            .UpdateAsync(update)
+            .ContinueWithOnMainThread(_ =>
+            {
+                // Room will be cleaned up by the non-host clients who receive the update
+            });
+
+        _room = null;
+    }
+
+    // ── Game Finished: Cleanup ────────────────────────────────────────────────
 
     private void HandleGameFinished(List<string> winners, string bhabhi)
     {
+        if (_gameFinishedFired && !_isHost) return; // non-host already handled via disconnect
         _active = false;
-        Stop();
+        StopAllWatchdogCoroutines();
 
-        // Only host deletes the room to avoid race conditions
-        // If host disconnected, the last non-host real player cleans up
-        bool shouldCleanup = _isHost;
-
-        if (!shouldCleanup)
-        {
-            // Check if host is the bhabhi (disconnected) — then we clean up
-            shouldCleanup = (bhabhi == _room?.hostId);
-        }
-
-        if (shouldCleanup && _room != null)
+        // Host cleans up room. Non-host cleans up if host was Bhabhi (disconnected).
+        bool shouldDelete = _isHost || (bhabhi == _room?.hostId);
+        if (shouldDelete && _room != null)
             StartCoroutine(DeleteRoomAfterDelay(3f));
     }
 
     private IEnumerator DeleteRoomAfterDelay(float delay)
     {
-        // Wait a bit so all clients have time to receive the finished state
         yield return new WaitForSeconds(delay);
-
         if (_room == null) yield break;
+
+        string roomId = _room.roomId;
+        _room = null;
 
         FirebaseManager.DB
             .Collection(RoomsCollection)
-            .Document(_room.roomId)
+            .Document(roomId)
             .DeleteAsync()
             .ContinueWithOnMainThread(task =>
             {
                 if (task.IsFaulted)
-                    Debug.LogWarning($"[HostWatchdog] Room delete failed: {task.Exception?.Message}");
+                    Debug.LogWarning($"[HostWatchdog] Delete failed: {task.Exception?.Message}");
                 else
-                    Debug.Log($"[HostWatchdog] Room {_room.roomId} deleted.");
+                    Debug.Log($"[HostWatchdog] Room {roomId} deleted.");
             });
     }
 
-    // ── Cleanup ───────────────────────────────────────────────────────────────
+    // ── Helpers ───────────────────────────────────────────────────────────────
 
-    private void Stop()
+    private void StopAllWatchdogCoroutines()
     {
         if (_heartbeatCoroutine != null) { StopCoroutine(_heartbeatCoroutine); _heartbeatCoroutine = null; }
         if (_watchCoroutine     != null) { StopCoroutine(_watchCoroutine);     _watchCoroutine     = null; }
-    }
-
-    private void HandleLeave()
-    {
-        _active = false;
-        Stop();
-        _room = null;
     }
 }

@@ -100,13 +100,11 @@ public static partial class EventManager
     // ── Hand Updates ──────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Fired whenever the local player's hand changes outside of normal card play:
-    /// - Picked up cards after out-of-suit (thulla)
-    /// - Stole cards from left player
-    /// - Drew card in shootout
-    /// InGameView listens and rebuilds the card hand display.
+    /// Fired whenever the local player's hand changes (card played, pickup, steal, shootout).
+    /// Carries both the new hand AND the latest GameState so InGameView can update
+    /// _gs before calling RefreshCardInteractability — avoiding stale state bugs.
     /// </summary>
-    public static event Action<List<string>> OnLocalHandUpdated; // list of shortCodes
-    public static void FireLocalHandUpdated(List<string> hand)
-        => OnLocalHandUpdated?.Invoke(hand);
+    public static event Action<List<string>, GameState> OnLocalHandUpdated;
+    public static void FireLocalHandUpdated(List<string> hand, GameState gs)
+        => OnLocalHandUpdated?.Invoke(hand, gs);
 }

@@ -265,22 +265,44 @@ public class InGameView : MonoBehaviour
             return;
         }
 
-        // ── Round 1, first card: ONLY Ace of Spades is playable ──────────────
-        bool isRound1Lead = _gs.roundNumber == 1 && _gs.cardsInPlay.Count == 0;
-        if (isRound1Lead)
+        // ── Round 1: special suit restriction ───────────────────────────────────
+        if (_gs.roundNumber == 1)
         {
-            foreach (var go in _spawnedCards)
+            bool isRound1Leader = _gs.cardsInPlay.Count == 0;
+
+            if (isRound1Leader)
             {
-                if (go == null) continue;
-                var btn = go.GetComponent<Button>();
-                if (btn != null) btn.interactable = (go.name == "AS");
+                // Leader MUST play Ace of Spades — only AS is interactable
+                foreach (var go in _spawnedCards)
+                {
+                    if (go == null) continue;
+                    var btn = go.GetComponent<Button>();
+                    if (btn != null) btn.interactable = (go.name == "AS");
+                }
+            }
+            else
+            {
+                // Followers: must play a spade if they have one.
+                // If no spade, ALL cards are interactable (any card goes to discard).
+                bool hasSpade = false;
+                foreach (var go in _spawnedCards)
+                    if (go != null && GetSuit(go.name) == "S") { hasSpade = true; break; }
+
+                foreach (var go in _spawnedCards)
+                {
+                    if (go == null) continue;
+                    var btn = go.GetComponent<Button>();
+                    if (btn == null) continue;
+                    // If has spades: only spades clickable. If no spades: all clickable.
+                    btn.interactable = hasSpade ? (GetSuit(go.name) == "S") : true;
+                }
             }
             return;
         }
 
-        // ── Normal play ───────────────────────────────────────────────────────
+        // ── Normal rounds ─────────────────────────────────────────────────────
         string leadSuit    = _gs.leadSuit;
-        bool   isLeading   = string.IsNullOrEmpty(leadSuit); // first card of round
+        bool   isLeading   = string.IsNullOrEmpty(leadSuit); // first card of this round
         bool   hasLeadSuit = false;
 
         if (!isLeading)
@@ -298,11 +320,11 @@ public class InGameView : MonoBehaviour
 
             bool canPlay;
             if (isLeading)
-                canPlay = true;                               // leading — any card
+                canPlay = true;                              // leading — any card
             else if (!hasLeadSuit)
-                canPlay = true;                               // thulla — any card
+                canPlay = true;                              // thulla — any card
             else
-                canPlay = GetSuit(go.name) == leadSuit;      // must follow suit
+                canPlay = GetSuit(go.name) == leadSuit;     // must follow suit
 
             btn.interactable = canPlay;
         }
@@ -487,9 +509,17 @@ public class InGameView : MonoBehaviour
     /// Bug fix #4: After rebuild, immediately refreshes interactability on new GOs.
     /// Called AFTER GameManager has already updated _myHand and _gs.
     /// </summary>
-    private void HandleLocalHandUpdated(List<string> handCodes)
+    private void HandleLocalHandUpdated(List<string> handCodes, GameState gs)
     {
-        // Rebuild card GOs from complete new hand
+        // Update _gs FIRST so RefreshCardInteractability sees the correct
+        // CurrentPlayerId. This is critical for thulla: GameManager sets
+        // currentPlayerIndex to the pickup player BEFORE firing this event,
+        // but InGameView._gs is only updated by HandleGameStateUpdated.
+        // Carrying gs here ensures _gs is fresh before we check interactability.
+        if (gs != null) _gs = gs;
+
+        // Rebuild card GOs from complete new hand.
+        // Called after every local card play, thulla pickup, steal, shootout draw.
         var hand = new List<CardData>();
         foreach (var code in handCodes)
         {
@@ -499,9 +529,8 @@ public class InGameView : MonoBehaviour
 
         SpawnCards(hand);
 
-        // Immediately refresh interactability using current game state
-        // This fixes bug #4 where turn was stuck after thulla because
-        // new card GOs had no interactability set until next state update
+        // Refresh interactability — now _gs is up to date so CurrentPlayerId
+        // correctly identifies whether it's local player's turn.
         RefreshCardInteractability();
     }
 
@@ -613,10 +642,10 @@ public class InGameView : MonoBehaviour
 
     private void OnCardClicked(string cardCode)
     {
-        // Fire to GameManager first — it validates and processes
+        // Fire to GameManager — it validates, updates _myHand, then fires
+        // FireLocalHandUpdated which rebuilds the hand display.
+        // Do NOT remove card here — GameManager drives all hand changes.
         EventManager.FireLocalCardPlayed(cardCode);
-        // Remove from view only after firing (GameManager may reject invalid plays)
-        RemoveCardFromHand(cardCode);
     }
 
     private void OnFlippedCardClicked()
