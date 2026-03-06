@@ -86,6 +86,7 @@ public class InGameView : MonoBehaviour
     private List<GameObject> _flippedCards  = new List<GameObject>();
     private GameState        _gs;
     private Coroutine        _timerCoroutine;
+    private bool             _autoSort;      // true after player taps Sort once
 
     // ── Unity ─────────────────────────────────────────────────────────────────
 
@@ -132,7 +133,8 @@ public class InGameView : MonoBehaviour
     private void HandleGameReady(List<CardData> localHand, List<SlotData> seatedPlayers)
     {
         _seatedPlayers = seatedPlayers;
-        _gs = null;
+        _gs            = null;
+        _autoSort      = false;   // reset per game — player must opt in each session
 
         PopulateProfiles(seatedPlayers);
         SpawnCards(localHand);
@@ -487,6 +489,10 @@ public class InGameView : MonoBehaviour
 
             _spawnedCards.Add(go);
         }
+
+        // Improvement 1: if player opted into auto-sort, apply it after every rebuild
+        if (_autoSort)
+            SortCards();
     }
 
     private void RemoveCardFromHand(string cardCode)
@@ -659,7 +665,11 @@ public class InGameView : MonoBehaviour
         EventManager.FireStealHandRequested();
     }
 
-    private void OnSortClicked()  => SortCards();
+    private void OnSortClicked()
+    {
+        _autoSort = true;   // from now on, every hand rebuild auto-sorts
+        SortCards();
+    }
     private void OnLeaveClicked() => EventManager.FireLeaveGameRequested();
 
     // ── Helpers ───────────────────────────────────────────────────────────────

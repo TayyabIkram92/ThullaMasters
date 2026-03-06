@@ -38,8 +38,9 @@ public class InGameManager : MonoBehaviour
 
     // ── State ─────────────────────────────────────────────────────────────────
 
-    private RoomData            _room;
-    private bool                _isHost;
+    private RoomData _room;
+    private bool _isHost;
+    private bool _proceeded; // guard: ProceedToGame fires only once per game
     private ListenerRegistration _listener;
 
     /// <summary>Exposed for GameManager to access room data and hands.</summary>
@@ -49,19 +50,24 @@ public class InGameManager : MonoBehaviour
 
     private void Awake()
     {
-        if (Instance != null && Instance != this) { Destroy(gameObject); return; }
+        if (Instance != null && Instance != this)
+        {
+            Destroy(gameObject);
+            return;
+        }
+
         Instance = this;
     }
 
     private void OnEnable()
     {
-        EventManager.OnMatchFound        += HandleMatchFound;
+        EventManager.OnMatchFound += HandleMatchFound;
         EventManager.OnLeaveGameRequested += HandleLeaveGame;
     }
 
     private void OnDisable()
     {
-        EventManager.OnMatchFound        -= HandleMatchFound;
+        EventManager.OnMatchFound -= HandleMatchFound;
         EventManager.OnLeaveGameRequested -= HandleLeaveGame;
         StopListener();
     }
@@ -75,8 +81,12 @@ public class InGameManager : MonoBehaviour
 
     private void HandleMatchFound(RoomData room)
     {
-        _room   = room;
+        _room = room;
         _isHost = room.hostId == PlayerDataManager.PlayFabId;
+        _proceeded = false;
+
+        Debug.Log($"[InGameManager] HandleMatchFound. isHost={_isHost} roomId={room.roomId} " +
+                  $"players={room.players.Count}");
 
         if (_isHost)
             DealCards();
@@ -129,8 +139,8 @@ public class InGameManager : MonoBehaviour
 
         var updateDict = new Dictionary<string, object>
         {
-            { "status", "dealing"               },
-            { "hands",  _room.HandsToDictionary() }
+            { "status", "dealing" },
+            { "hands", _room.HandsToDictionary() }
         };
 
         FirebaseManager.DB
@@ -177,10 +187,10 @@ public class InGameManager : MonoBehaviour
                 if (updated.status != "dealing") return;
 
                 // Check for both raw id and sanitized id (dots replaced with underscores)
-                string localId      = PlayerDataManager.PlayFabId;
-                string sanitizedId  = localId.Replace(".", "_");
-                bool   hasHand      = updated.hands.ContainsKey(localId) ||
-                                      updated.hands.ContainsKey(sanitizedId);
+                string localId = PlayerDataManager.PlayFabId;
+                string sanitizedId = localId.Replace(".", "_");
+                bool hasHand = updated.hands.ContainsKey(localId) ||
+                               updated.hands.ContainsKey(sanitizedId);
                 if (!hasHand)
                 {
                     Debug.LogWarning($"[InGameManager] Hand not found for {localId} or {sanitizedId}. Waiting...");
@@ -198,11 +208,14 @@ public class InGameManager : MonoBehaviour
                             updated.players[i].id = localId;
                 }
 
+                if (_proceeded) return; // already proceeding — ignore duplicate snapshot
+
                 // Got our hand — stop listening, proceed
                 _room = updated;
+                _proceeded = true;
                 StopListener();
 
-                Debug.Log("[InGameManager] Received hand from Firestore.");
+                Debug.Log("[InGameManager] Received hand from Firestore. Proceeding to game.");
                 ProceedToGame();
             });
     }
@@ -256,8 +269,9 @@ public class InGameManager : MonoBehaviour
     private void HandleLeaveGame()
     {
         StopListener();
-        _room   = null;
+        _room = null;
         _isHost = false;
+        _proceeded = false;
 
         EventManager.FireShowView(UI.ViewType.Home);
     }
@@ -267,7 +281,11 @@ public class InGameManager : MonoBehaviour
     private IEnumerator DelayedProceedToGame(float delay)
     {
         yield return new UnityEngine.WaitForSeconds(delay);
-        ProceedToGame();
+        if (!_proceeded)
+        {
+            _proceeded = true;
+            ProceedToGame();
+        }
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
