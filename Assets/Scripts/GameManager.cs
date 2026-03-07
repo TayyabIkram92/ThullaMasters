@@ -23,13 +23,28 @@ public class GameManager : MonoBehaviour
     private const float ResolveDelaySeconds = 3f;
     private List<string> _myHand = new List<string>();
 
-    [Header("Bot Difficulty")]
-    [Tooltip("True = bots use hard AI strategy. False = bots use basic auto-play.")]
+    // ── Round Logger ──────────────────────────────────────────────────────────
+    // Stores one line per round so we can dump the whole game at once.
+    // Format (clean):  Round N : card1 (label1), card2 (label2), ...  → label_winner leads
+    // Format (thulla): Round N : card1 (label1), card2 (label2) THULLA card3 (label3)  → label_pickup PICKS UP N cards
+    private readonly List<string> _roundLog = new List<string>();
+
+    private readonly List<(string pid, string card, bool isThulla)> _currentRoundBuffer
+        = new List<(string, string, bool)>();
+
+    private List<SlotData> _seatedPlayers = new List<SlotData>();
+
+    [Header("Bot Difficulty")] [Tooltip("True = bots use hard AI strategy. False = bots use basic auto-play.")]
     public bool useHardBot = false;
 
     private void Awake()
     {
-        if (Instance != null && Instance != this) { Destroy(gameObject); return; }
+        if (Instance != null && Instance != this)
+        {
+            Destroy(gameObject);
+            return;
+        }
+
         Instance = this;
     }
 
@@ -56,13 +71,20 @@ public class GameManager : MonoBehaviour
     private void HandleGameReady(List<CardData> localHand, List<SlotData> seatedPlayers)
     {
         _room = GetCurrentRoom();
-        if (_room == null) { Debug.LogError("[GameManager] HandleGameReady: CurrentRoom is null."); return; }
+        if (_room == null)
+        {
+            Debug.LogError("[GameManager] HandleGameReady: CurrentRoom is null.");
+            return;
+        }
+
         _isHost = _room.hostId == PlayerDataManager.PlayFabId;
         _gameActive = false;
         _isExecutingMove = false;
         _lastProcessedTurnKey = -1;
         _gs = null;
-        _voidTracker.Clear();
+        _botStrategy.Reset();
+        _roundLog.Clear();
+        _seatedPlayers = seatedPlayers != null ? new List<SlotData>(seatedPlayers) : new List<SlotData>();
         _myHand.Clear();
         foreach (var c in localHand) _myHand.Add(c.ShortCode);
         Debug.Log($"[GameManager] HandleGameReady. isHost={_isHost} hand={_myHand.Count} room={_room.roomId}");
@@ -77,25 +99,38 @@ public class GameManager : MonoBehaviour
     private async Task InitialiseGameStateAsync()
     {
         _room = GetCurrentRoom();
-        if (_room == null) { Debug.LogError("[GameManager] InitialiseGameState: Room is null."); return; }
-        if (_room.hands.Count == 0) { Debug.LogError("[GameManager] InitialiseGameState: no hands."); return; }
+        if (_room == null)
+        {
+            Debug.LogError("[GameManager] InitialiseGameState: Room is null.");
+            return;
+        }
+
+        if (_room.hands.Count == 0)
+        {
+            Debug.LogError("[GameManager] InitialiseGameState: no hands.");
+            return;
+        }
 
         _gs = new GameState();
-        _gs.phase       = GameState.PhasePlaying;
+        _gs.phase = GameState.PhasePlaying;
         _gs.roundNumber = 1;
         foreach (var p in _room.players) _gs.activePlayers.Add(p.id);
-        foreach (var kv in _room.hands)  _gs.hands[kv.Key] = new List<string>(kv.Value);
+        foreach (var kv in _room.hands) _gs.hands[kv.Key] = new List<string>(kv.Value);
 
         int startIndex = 0;
         for (int i = 0; i < _gs.activePlayers.Count; i++)
         {
             string pid = _gs.activePlayers[i];
-            if (_gs.hands.ContainsKey(pid) && _gs.hands[pid].Contains("AS")) { startIndex = i; break; }
+            if (_gs.hands.ContainsKey(pid) && _gs.hands[pid].Contains("AS"))
+            {
+                startIndex = i;
+                break;
+            }
         }
 
         _gs.currentPlayerIndex = startIndex;
-        _gs.leadSuit           = "";
-        _gs.turnStartTime      = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        _gs.leadSuit = "";
+        _gs.turnStartTime = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
         // Await the write: non-host listeners fire AFTER this confirms.
         // Guarantees all clients receive a confirmed gameState before round 1.
@@ -110,7 +145,7 @@ public class GameManager : MonoBehaviour
         Debug.Log($"[GameManager] GameState confirmed. First player index={startIndex} ({_gs.CurrentPlayerId})");
 
         _gameActive = true;
-        StartListening();                       // start listener AFTER write confirmed
+        StartListening(); // start listener AFTER write confirmed
         EventManager.FireGameStateUpdated(_gs);
         ProcessCurrentTurn();
     }
@@ -177,7 +212,11 @@ public class GameManager : MonoBehaviour
             });
     }
 
-    private void StopListener() { _listener?.Stop(); _listener = null; }
+    private void StopListener()
+    {
+        _listener?.Stop();
+        _listener = null;
+    }
 
     /// <summary>
     /// Returns true if both lists contain exactly the same cards (order-independent).
@@ -188,10 +227,13 @@ public class GameManager : MonoBehaviour
     private bool HandsMatchSorted(List<string> a, List<string> b)
     {
         if (a.Count != b.Count) return false;
-        var sa = new List<string>(a); sa.Sort();
-        var sb = new List<string>(b); sb.Sort();
+        var sa = new List<string>(a);
+        sa.Sort();
+        var sb = new List<string>(b);
+        sb.Sort();
         for (int i = 0; i < sa.Count; i++)
-            if (sa[i] != sb[i]) return false;
+            if (sa[i] != sb[i])
+                return false;
         return true;
     }
 
@@ -200,15 +242,29 @@ public class GameManager : MonoBehaviour
         StopTurnTimer();
         StopBotCoroutine();
         if (_gs == null || !_gameActive) return;
-        if (_gs.phase == GameState.PhaseShootout) { ProcessShootoutTurn(); return; }
+        if (_gs.phase == GameState.PhaseShootout)
+        {
+            ProcessShootoutTurn();
+            return;
+        }
+
         if (_gs.phase == GameState.PhaseFinished) return;
 
         string currentId = _gs.CurrentPlayerId;
         string localId = PlayerDataManager.PlayFabId;
-        if (string.IsNullOrEmpty(currentId)) { Debug.LogWarning("[GameManager] ProcessCurrentTurn: empty."); return; }
+        if (string.IsNullOrEmpty(currentId))
+        {
+            Debug.LogWarning("[GameManager] ProcessCurrentTurn: empty.");
+            return;
+        }
 
         int turnKey = _gs.roundNumber * 1000 + _gs.currentPlayerIndex;
-        if (turnKey == _lastProcessedTurnKey) { Debug.Log($"[GameManager] Skipping dup turn {turnKey}"); return; }
+        if (turnKey == _lastProcessedTurnKey)
+        {
+            Debug.Log($"[GameManager] Skipping dup turn {turnKey}");
+            return;
+        }
+
         _lastProcessedTurnKey = turnKey;
         _isExecutingMove = false;
 
@@ -249,7 +305,14 @@ public class GameManager : MonoBehaviour
         }
     }
 
-    private void StopTurnTimer() { if (_turnTimerCoroutine != null) { StopCoroutine(_turnTimerCoroutine); _turnTimerCoroutine = null; } }
+    private void StopTurnTimer()
+    {
+        if (_turnTimerCoroutine != null)
+        {
+            StopCoroutine(_turnTimerCoroutine);
+            _turnTimerCoroutine = null;
+        }
+    }
 
     private void AutoPlay(string playerId)
     {
@@ -266,438 +329,27 @@ public class GameManager : MonoBehaviour
 
 
     // ═════════════════════════════════════════════════════════════════════════
-    // ── HARD BOT AI  v3 ──────────────────────────────────────────────────────
+    // ── HARD BOT AI — delegated to BotStrategy (Single Responsibility) ───────
     //
-    // CORE UNDERSTANDING OF THULLA:
-    //   When you LEAD a suit, if ANY player after you in this round has NO cards
-    //   of that suit, they will play a thulla. The highest lead-suit card holder
-    //   picks up ALL cards. If WE are the highest, WE pick up — that's bad.
-    //
-    //   Since the bot can see ALL hands, it knows EXACTLY who is void in what.
-    //   This is the most powerful advantage: zero guessing.
-    //
-    // LEAD STRATEGY (priority order):
-    //   1. SAFE DISCARD: Lead a suit where EVERYONE still playing has that suit.
-    //      This guarantees cards are discarded — no thulla possible.
-    //      Among safe suits, lead the one where we hold the highest card (burn it).
-    //      If we're not the highest, still safe — cards get discarded.
-    //
-    //   2. FORCE THULLA ON OTHERS (not us): Lead a suit where:
-    //      - The player void in it has ALREADY played (they can't thulla us)
-    //      - OR we are NOT the highest card holder in that suit
-    //        (if thulla happens, someone else picks up, not us)
-    //      This dumps our card AND punishes someone else.
-    //
-    //   3. LAST RESORT: We have no completely safe suit. Pick the suit where
-    //      we are NOT the highest card holder. If a thulla happens, someone
-    //      else picks up. If round goes clean, cards discarded. Either way,
-    //      we don't pick up.
-    //
-    //   4. ABSOLUTE FALLBACK: Lead smallest suit to go void fastest.
-    //      (Happens only when we hold the highest card in every suit — very rare.)
-    //
-    // FOLLOW STRATEGY:
-    //   - If thulla is coming from any remaining player → burn a high card
-    //     (we won't be the pickup target since we're following suit)
-    //   - Round is clean → play highest to win lead + control
-    //   - If we ARE the current highest AND thulla is coming → play second-highest
-    //     (can't avoid being highest anyway if nobody else has higher, so burn it)
-    //
-    // THULLA STRATEGY:
-    //   - Play HIGHEST card from SMALLEST suit (dump dangerous card + go void faster)
-    //
+    // All strategy logic lives in BotStrategy.cs.
+    // GameManager only owns: turn sequencing, Firestore writes, event firing.
+    // BotStrategy owns: card selection, lookahead simulation, pattern tracking.
     // ═════════════════════════════════════════════════════════════════════════
 
-    // ── Void Tracker ──────────────────────────────────────────────────────────
-    private readonly Dictionary<string, HashSet<string>> _voidTracker
-        = new Dictionary<string, HashSet<string>>();
+    private readonly BotStrategy _botStrategy = new BotStrategy();
 
+    /// <summary>Called from ExecuteMove for every card played — feeds pattern tracker.</summary>
     private void UpdateVoidTracker(string playerId, string cardCode)
     {
-        if (!useHardBot) return;
-        if (string.IsNullOrEmpty(_gs.leadSuit)) return;
-        if (GetSuit(cardCode) == _gs.leadSuit) return;
+    } // handled by BotStrategy
 
-        if (!_voidTracker.ContainsKey(playerId))
-            _voidTracker[playerId] = new HashSet<string>();
-        _voidTracker[playerId].Add(_gs.leadSuit);
-        Debug.Log($"[HardBot] VoidTracker: {playerId} confirmed void in {_gs.leadSuit}");
-    }
-
-    private bool IsConfirmedVoid(string playerId, string suit)
-        => _voidTracker.ContainsKey(playerId) && _voidTracker[playerId].Contains(suit);
-
-    /// <summary>
-    /// Returns true if the given player has NO cards of the given suit.
-    /// Uses full hand visibility (bot sees all hands). Void tracker as backup.
-    /// </summary>
-    private bool ActuallyVoidInSuit(string pid, string suit)
-    {
-        if (IsConfirmedVoid(pid, suit)) return true;
-        if (!_gs.hands.ContainsKey(pid)) return false;
-        return !_gs.hands[pid].Exists(c => GetSuit(c) == suit);
-    }
-
-    // ── Entry Point ───────────────────────────────────────────────────────────
-
+    /// <summary>Delegates card choice to BotStrategy.</summary>
     private string ChooseHardBotCard(string botId, List<string> hand)
-    {
-        // Round 1 special rules
-        if (_gs.roundNumber == 1 && _gs.cardsInPlay.Count == 0 && hand.Contains("AS"))
-            return "AS";
-        if (_gs.roundNumber == 1 && _gs.cardsInPlay.Count > 0)
-        {
-            var spades1 = hand.FindAll(c => GetSuit(c) == "S");
-            if (spades1.Count > 0) return MidHighOf(spades1);
-            return HighestOf(hand);
-        }
+        => _botStrategy.ChooseCard(_gs, botId, hand);
 
-        bool isLeading = string.IsNullOrEmpty(_gs.leadSuit);
-        return isLeading ? HardBotLead(botId, hand) : HardBotFollow(botId, hand);
-    }
-
-    // ── LEADING ───────────────────────────────────────────────────────────────
-    //
-    // THULLA PICKUP RULE (exact mechanics):
-    //   - You lead suitX with card C.
-    //   - The IMMEDIATE NEXT player is void in suitX → they thulla → round ends NOW.
-    //   - YOU pick up all cards (you played C, they played their thulla card).
-    //   - Your hand INCREASES. This is the worst outcome when leading.
-    //
-    // So when leading, the ONE thing that matters most is:
-    //   Does the IMMEDIATE NEXT player have cards of the suit I want to lead?
-    //   If NO → I will pick up my own card + their thulla card. NEVER lead that suit.
-    //   If YES → the next player follows. Now if a LATER player is void and thullas,
-    //            the highest lead-suit card holder picks up — could be anyone, not me
-    //            (unless I played the highest, but that's a separate calculation).
-    //
-    // PRIORITY ORDER:
-    //   1. Lead a suit where the NEXT player has that suit AND someone further
-    //      down the chain is void → PERFECT: we dump card, someone else picks up.
-    //   2. Lead a suit where EVERYONE has it → safe discard, all cards discarded.
-    //      Among these, prefer the suit where we hold the highest card (burn A/K).
-    //   3. Lead a suit where the NEXT player has it (no immediate thulla on us).
-    //      Even if round goes fully clean, at least our card is discarded.
-    //      Among these, prefer suits where a later player IS void
-    //      (likely someone else picks up, not us).
-    //   4. Absolute fallback: every suit we have, the next player is void.
-    //      We MUST pick up no matter what. Minimize damage: lead suit with
-    //      fewest cards (lose fewest extra cards to pickup).
-
-    private string HardBotLead(string botId, List<string> hand)
-    {
-        var    bySuit     = GroupBySuit(hand);
-        string nextPid    = GetNextActivePlayer(botId);
-
-        // Categorise each suit we hold by what will happen if we lead it
-        var safeAndForcing  = new List<string>(); // next has it + later someone void
-        var safeAndClean    = new List<string>(); // everyone has it (guaranteed discard)
-        var safeOnly        = new List<string>(); // next has it, rest unknown/clean
-        var dangerSuits     = new List<string>(); // next is void → we pick up
-
-        foreach (var suit in bySuit.Keys)
-        {
-            bool nextHasSuit = !string.IsNullOrEmpty(nextPid) && !ActuallyVoidInSuit(nextPid, suit);
-
-            if (!nextHasSuit)
-            {
-                dangerSuits.Add(suit);
-                continue;
-            }
-
-            // Next player has it. Check if any LATER player is void (forcing a pickup on them)
-            bool laterVoidExists = false;
-            foreach (var pid in _gs.activePlayers)
-            {
-                if (pid == botId || pid == nextPid) continue;
-                if (ActuallyVoidInSuit(pid, suit)) { laterVoidExists = true; break; }
-            }
-
-            // Check if ALL players have it (fully clean round)
-            bool allHaveIt = true;
-            foreach (var pid in _gs.activePlayers)
-            {
-                if (pid == botId) continue;
-                if (ActuallyVoidInSuit(pid, suit)) { allHaveIt = false; break; }
-            }
-
-            if (allHaveIt)
-                safeAndClean.Add(suit);
-            else if (laterVoidExists)
-                safeAndForcing.Add(suit);  // next follows, but later someone picks up
-            else
-                safeOnly.Add(suit);        // next follows, rest also have it
-        }
-
-        // ── PRIORITY 1: Next has it + later player void ───────────────────────
-        // Perfect: we dump a card, someone else down the chain picks up.
-        // Among these, prefer the suit where we are NOT the highest card holder
-        // (minimises chance we're the one who picks up when thulla hits).
-        if (safeAndForcing.Count > 0)
-        {
-            string best = PickLeadSuitFromList(botId, safeAndForcing, bySuit, preferNotHighest: true);
-            return PickLeadCard(bySuit[best]);
-        }
-
-        // ── PRIORITY 2: Fully clean round (everyone has the suit) ────────────
-        // Guaranteed discard. Prefer suit where WE hold the highest card
-        // → burn our most dangerous card cleanly.
-        if (safeAndClean.Count > 0)
-        {
-            string best = PickLeadSuitFromList(botId, safeAndClean, bySuit, preferNotHighest: false);
-            return PickLeadCard(bySuit[best]);
-        }
-
-        // ── PRIORITY 3: Next has it (safe from immediate thulla) ─────────────
-        // No later void found, so round likely goes clean. Safe to dump.
-        if (safeOnly.Count > 0)
-        {
-            string best = PickLeadSuitFromList(botId, safeOnly, bySuit, preferNotHighest: false);
-            return PickLeadCard(bySuit[best]);
-        }
-
-        // ── PRIORITY 4: All suits are dangerous (next player void in all) ─────
-        // We WILL pick up no matter what. Lead suit with fewest cards to minimise
-        // total cards added to hand (fewer cards in play = fewer picked up).
-        string fallback = SmallestSuit(new List<string>(bySuit.Keys), bySuit);
-        return PickLeadCard(bySuit[fallback]);
-    }
-
-    /// <summary>
-    /// From a list of candidate suits, picks the best one to lead.
-    /// preferNotHighest=true: prefer suits where we do NOT hold the
-    ///   highest card across all players (someone else is the pickup target
-    ///   if a thulla happens later in the round).
-    /// preferNotHighest=false: prefer suits where we DO hold the highest card
-    ///   (guarantees we burn our most dangerous card in a clean round).
-    /// In both cases, among equally ranked options, prefer the suit where our
-    /// highest card has the highest rank (burn the most dangerous card first).
-    /// </summary>
-    private string PickLeadSuitFromList(string botId, List<string> suits,
-                                         Dictionary<string, List<string>> bySuit,
-                                         bool preferNotHighest)
-    {
-        // Score each suit: higher score = better choice
-        string bestSuit  = suits[0];
-        int    bestScore = int.MinValue;
-
-        foreach (var suit in suits)
-        {
-            int ourHighRank = GetRankValue(HighestOf(bySuit[suit]));
-
-            // Are we the highest card holder in this suit across all players?
-            bool weAreHighest = true;
-            foreach (var pid in _gs.activePlayers)
-            {
-                if (pid == botId) continue;
-                if (!_gs.hands.ContainsKey(pid)) continue;
-                if (_gs.hands[pid].Exists(c => GetSuit(c) == suit && GetRankValue(c) > ourHighRank))
-                {
-                    weAreHighest = false;
-                    break;
-                }
-            }
-
-            int score = 0;
-
-            if (preferNotHighest)
-            {
-                // Reward NOT being highest (someone else picks up if thulla happens)
-                if (!weAreHighest) score += 100;
-                // Among equally ranked options, prefer burning a high card
-                score += ourHighRank;
-            }
-            else
-            {
-                // Reward BEING highest (we control the round, burn our dangerous card)
-                if (weAreHighest) score += 100;
-                score += ourHighRank;
-            }
-
-            if (score > bestScore) { bestScore = score; bestSuit = suit; }
-        }
-
-        return bestSuit;
-    }
-
-    /// <summary>
-    /// Picks the card to play when leading a chosen suit.
-    /// - 1 card  → play it
-    /// - 2 cards → play highest (burn it, save the low one for endgame)
-    /// - 3+cards → play second-highest (burn a dangerous card, keep the very
-    ///             highest for later control AND the lowest for endgame escape)
-    /// </summary>
-    private string PickLeadCard(List<string> suitCards)
-    {
-        if (suitCards.Count == 1) return suitCards[0];
-        if (suitCards.Count == 2) return HighestOf(suitCards);
-        return MidHighOf(suitCards); // second-highest
-    }
-
-    // ── FOLLOWING ─────────────────────────────────────────────────────────────
-
-    private string HardBotFollow(string botId, List<string> hand)
-    {
-        string lead      = _gs.leadSuit;
-        var    suitCards = hand.FindAll(c => GetSuit(c) == lead);
-
-        if (suitCards.Count > 0)
-        {
-            // Will any remaining player (who hasn't played yet) thulla?
-            bool thullaComingFromRemaining = WillAnyRemainingPlayerThulla(botId, lead);
-
-            if (!thullaComingFromRemaining)
-            {
-                // Clean round — play HIGHEST. Burns our dangerous card, win lead if possible.
-                return HighestOf(suitCards);
-            }
-            else
-            {
-                // Thulla is coming from someone. We're following suit so we won't
-                // be the pickup target (only lead-suit holders pick up, and the
-                // thulla-er ends the round — the highest lead-suit card holder picks up).
-                // Just burn our HIGHEST card here — someone else is the pickup.
-                // Exception: if WE currently hold the highest lead-suit card played
-                // AND there's still a higher card we could avoid (play second-highest
-                // hoping someone else plays higher, or just burn it anyway).
-                string ourHighest        = HighestOf(suitCards);
-                string currentPlayHigh   = GetCurrentHighestInPlay(lead);
-                int    currentHighRank   = GetRankValue(currentPlayHigh);
-                int    ourRank           = GetRankValue(ourHighest);
-
-                if (ourRank > currentHighRank)
-                {
-                    // We would become the new highest → thulla picks us up
-                    // Play SECOND highest if available — maybe someone after us
-                    // will also play higher, taking lead away from us
-                    if (suitCards.Count >= 2) return SecondHighestOf(suitCards);
-                }
-                // Burn highest — we're not currently the top, so we're safe
-                return ourHighest;
-            }
-        }
-        else
-        {
-            // No lead suit — must thulla. Play HIGHEST from SMALLEST suit.
-            return HighestCardFromSmallestSuit(hand);
-        }
-    }
-
-    /// <summary>
-    /// Returns true if any active player who has NOT yet played this round
-    /// is void in the lead suit. Uses full hand visibility.
-    /// </summary>
-    private bool WillAnyRemainingPlayerThulla(string botId, string leadSuit)
-    {
-        var playedIds = new HashSet<string>();
-        foreach (var pc in _gs.cardsInPlay) playedIds.Add(pc.playerId);
-
-        foreach (var pid in _gs.activePlayers)
-        {
-            if (pid == botId) continue;
-            if (playedIds.Contains(pid)) continue; // already played this round
-            if (ActuallyVoidInSuit(pid, leadSuit)) return true;
-        }
-        return false;
-    }
-
-    private string GetCurrentHighestInPlay(string leadSuit)
-    {
-        string best = ""; int bestRank = -1;
-        foreach (var pc in _gs.cardsInPlay)
-        {
-            if (GetSuit(pc.card) != leadSuit) continue;
-            int rank = GetRankValue(pc.card);
-            if (rank > bestRank) { bestRank = rank; best = pc.card; }
-        }
-        return best;
-    }
-
-    private string GetCurrentWinnerId(string leadSuit)
-    {
-        string winner = ""; int bestRank = -1;
-        foreach (var pc in _gs.cardsInPlay)
-        {
-            if (GetSuit(pc.card) != leadSuit) continue;
-            int rank = GetRankValue(pc.card);
-            if (rank > bestRank) { bestRank = rank; winner = pc.playerId; }
-        }
-        return winner;
-    }
-
-    /// <summary>
-    /// When forced to thulla: play HIGHEST from our SMALLEST suit.
-    /// Dumps most dangerous card + progresses toward void in that suit.
-    /// </summary>
-    private string HighestCardFromSmallestSuit(List<string> hand)
-    {
-        var bySuit = GroupBySuit(hand);
-        string smallest = ""; int fewest = int.MaxValue;
-        foreach (var kv in bySuit)
-            if (kv.Value.Count < fewest) { fewest = kv.Value.Count; smallest = kv.Key; }
-        return string.IsNullOrEmpty(smallest) ? HighestOf(hand) : HighestOf(bySuit[smallest]);
-    }
-
-    // ── SHARED HELPERS ────────────────────────────────────────────────────────
-
-    private string GetNextActivePlayer(string botId)
-    {
-        int idx = _gs.activePlayers.IndexOf(botId);
-        if (idx < 0 || _gs.activePlayers.Count <= 1) return "";
-        return _gs.activePlayers[(idx + 1) % _gs.activePlayers.Count];
-    }
-
-    private Dictionary<string, List<string>> GroupBySuit(List<string> hand)
-    {
-        var dict = new Dictionary<string, List<string>>();
-        foreach (var c in hand)
-        {
-            string s = GetSuit(c);
-            if (!dict.ContainsKey(s)) dict[s] = new List<string>();
-            dict[s].Add(c);
-        }
-        return dict;
-    }
-
-    private string HighestOf(List<string> cards)
-    {
-        string best = cards[0];
-        foreach (var c in cards)
-            if (GetRankValue(c) > GetRankValue(best)) best = c;
-        return best;
-    }
-
-    private string SecondHighestOf(List<string> cards)
-    {
-        if (cards.Count <= 1) return cards[0];
-        var sorted = new List<string>(cards);
-        sorted.Sort((a, b) => GetRankValue(b).CompareTo(GetRankValue(a)));
-        return sorted[1];
-    }
-
-    private string MidHighOf(List<string> cards)
-    {
-        if (cards.Count <= 2) return HighestOf(cards);
-        var sorted = new List<string>(cards);
-        sorted.Sort((a, b) => GetRankValue(b).CompareTo(GetRankValue(a)));
-        return sorted[1]; // second-highest
-    }
-
-    private string LowestOf(List<string> cards)
-    {
-        string best = cards[0];
-        foreach (var c in cards)
-            if (GetRankValue(c) < GetRankValue(best)) best = c;
-        return best;
-    }
-
-    private string SmallestSuit(List<string> suits, Dictionary<string, List<string>> bySuit)
-    {
-        string best = suits[0];
-        foreach (var s in suits)
-            if (bySuit[s].Count < bySuit[best].Count) best = s;
-        return best;
-    }
+    /// <summary>Records every played card into BotStrategy pattern history.</summary>
+    private void RecordPlayHistory(string playerId, string cardCode)
+        => _botStrategy.RecordMove(_gs, playerId, cardCode);
 
     private string ChooseAutoCard(string playerId, List<string> hand)
     {
@@ -707,6 +359,7 @@ public class GameManager : MonoBehaviour
             var spades = hand.FindAll(c => GetSuit(c) == "S");
             return spades.Count > 0 ? spades[0] : hand[0];
         }
+
         if (string.IsNullOrEmpty(_gs.leadSuit)) return hand[0];
         var suitCards = hand.FindAll(c => GetSuit(c) == _gs.leadSuit);
         return suitCards.Count > 0 ? suitCards[0] : hand[0];
@@ -717,20 +370,50 @@ public class GameManager : MonoBehaviour
         if (_gs == null || !_gameActive) return;
         if (_gs.phase != GameState.PhasePlaying) return;
         string localId = PlayerDataManager.PlayFabId;
-        if (_gs.CurrentPlayerId != localId) { Debug.LogWarning($"[GameManager] Not my turn. Current={_gs.CurrentPlayerId}"); return; }
-        if (_isExecutingMove) { Debug.LogWarning("[GameManager] Move in-flight."); return; }
-        if (!_myHand.Contains(cardCode)) { Debug.LogWarning($"[GameManager] Card {cardCode} not in hand."); return; }
-        if (_gs.roundNumber == 1 && _gs.cardsInPlay.Count == 0 && cardCode != "AS") { Debug.LogWarning("[GameManager] Must play AS."); return; }
+        if (_gs.CurrentPlayerId != localId)
+        {
+            Debug.LogWarning($"[GameManager] Not my turn. Current={_gs.CurrentPlayerId}");
+            return;
+        }
+
+        if (_isExecutingMove)
+        {
+            Debug.LogWarning("[GameManager] Move in-flight.");
+            return;
+        }
+
+        if (!_myHand.Contains(cardCode))
+        {
+            Debug.LogWarning($"[GameManager] Card {cardCode} not in hand.");
+            return;
+        }
+
+        if (_gs.roundNumber == 1 && _gs.cardsInPlay.Count == 0 && cardCode != "AS")
+        {
+            Debug.LogWarning("[GameManager] Must play AS.");
+            return;
+        }
+
         if (_gs.roundNumber == 1 && _gs.cardsInPlay.Count > 0)
         {
             bool hasSpade = _myHand.Exists(c => GetSuit(c) == "S");
-            if (hasSpade && GetSuit(cardCode) != "S") { Debug.LogWarning("[GameManager] Must play spade."); return; }
+            if (hasSpade && GetSuit(cardCode) != "S")
+            {
+                Debug.LogWarning("[GameManager] Must play spade.");
+                return;
+            }
         }
+
         if (_gs.roundNumber > 1 && !string.IsNullOrEmpty(_gs.leadSuit))
         {
             bool hasLeadSuit = _myHand.Exists(c => GetSuit(c) == _gs.leadSuit);
-            if (hasLeadSuit && GetSuit(cardCode) != _gs.leadSuit) { Debug.LogWarning($"[GameManager] Must follow {_gs.leadSuit}."); return; }
+            if (hasLeadSuit && GetSuit(cardCode) != _gs.leadSuit)
+            {
+                Debug.LogWarning($"[GameManager] Must follow {_gs.leadSuit}.");
+                return;
+            }
         }
+
         _isExecutingMove = true;
         StopTurnTimer();
         ExecuteMove(localId, cardCode);
@@ -756,7 +439,11 @@ public class GameManager : MonoBehaviour
         _gs.activePlayers.Remove(leftId);
         AdjustCurrentIndexAfterRemoval();
         _gs.turnStartTime = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-        WriteGameState(() => { Debug.Log($"[GameManager] Stole from {leftId}."); EventManager.FireGameStateUpdated(_gs); });
+        WriteGameState(() =>
+        {
+            Debug.Log($"[GameManager] Stole from {leftId}.");
+            EventManager.FireGameStateUpdated(_gs);
+        });
     }
 
     private void ProcessShootoutTurn()
@@ -792,7 +479,13 @@ public class GameManager : MonoBehaviour
     private void ExecuteShootoutDraw(string drawerId)
     {
         string responderId = "";
-        foreach (var pid in _gs.activePlayers) if (pid != drawerId) { responderId = pid; break; }
+        foreach (var pid in _gs.activePlayers)
+            if (pid != drawerId)
+            {
+                responderId = pid;
+                break;
+            }
+
         if (string.IsNullOrEmpty(responderId)) return;
         if (!_gs.hands.ContainsKey(responderId) || _gs.hands[responderId].Count == 0) return;
         var responderHand = _gs.hands[responderId];
@@ -806,6 +499,7 @@ public class GameManager : MonoBehaviour
             _myHand = new List<string>(_gs.hands[drawerId]);
             EventManager.FireLocalHandUpdated(new List<string>(_myHand), _gs);
         }
+
         _gs.phase = GameState.PhasePlaying;
         _gs.leadSuit = "";
         _gs.cardsInPlay.Clear();
@@ -831,6 +525,10 @@ public class GameManager : MonoBehaviour
             cardCode = _gs.hands[playerId][0];
         }
 
+        // Log all hands at the START of each round (before any card is removed)
+        if (_gs.cardsInPlay.Count == 0)
+            LogHandSnapshot();
+
         // Remove card from hand
         _gs.hands[playerId].Remove(cardCode);
         if (playerId == PlayerDataManager.PlayFabId)
@@ -850,13 +548,18 @@ public class GameManager : MonoBehaviour
         if (playerId == PlayerDataManager.PlayFabId)
             EventManager.FireLocalHandUpdated(new List<string>(_myHand), _gs);
 
-        Debug.Log($"[GameManager] {playerId} played {cardCode}. In play: {_gs.cardsInPlay.Count}");
+        // Individual card plays logged quietly; full round summary fires at resolve time
+        // Accumulate into current round buffer (flushed in ResolveRound/ResolveOutOfSuit)
+        _currentRoundBuffer.Add((playerId, cardCode,
+            GetSuit(cardCode) != _gs.leadSuit && _gs.cardsInPlay.Count > 1)); // isThulla: not leader and off-suit
 
         // Update void tracker — if card is out of lead suit, player is confirmed void
         UpdateVoidTracker(playerId, cardCode);
+        // Record for pattern analysis (follow tendency, thulla frequency)
+        RecordPlayHistory(playerId, cardCode);
 
         bool roundComplete = _gs.cardsInPlay.Count >= _gs.activePlayers.Count;
-        bool outOfSuit     = GetSuit(cardCode) != _gs.leadSuit;
+        bool outOfSuit = GetSuit(cardCode) != _gs.leadSuit;
 
         // THULLA CHECK MUST COME BEFORE roundComplete CHECK.
         // When the last player (D) plays out of suit, both conditions are true:
@@ -906,21 +609,32 @@ public class GameManager : MonoBehaviour
         {
             if (GetSuit(pc.card) != roundLeadSuit) continue;
             int rank = GetRankValue(pc.card);
-            if (rank > highestRank) { highestRank = rank; winnerId = pc.playerId; }
+            if (rank > highestRank)
+            {
+                highestRank = rank;
+                winnerId = pc.playerId;
+            }
         }
-        Debug.Log($"[GameManager] Round {_gs.roundNumber} done. Winner={winnerId}");
+
+        FlushRoundLog(isThulla: false, pickupId: winnerId);
         var playedSnapshot = new List<PlayedCard>(_gs.cardsInPlay);
         _gs.cardsInPlay.Clear();
         _gs.leadSuit = "";
         _gs.roundNumber++;
         CheckForNewWinners();
-        if (_gs.activePlayers.Count == 0) { CheckGameOverWithBhabhi(winnerId); return; }
+        if (_gs.activePlayers.Count == 0)
+        {
+            CheckGameOverWithBhabhi(winnerId);
+            return;
+        }
+
         if (!string.IsNullOrEmpty(winnerId) && !_gs.activePlayers.Contains(winnerId))
         {
             string nextLeaderId = GetSecondHighestSuitCardPlayer(winnerId, roundLeadSuit, playedSnapshot);
             if (!string.IsNullOrEmpty(nextLeaderId)) winnerId = nextLeaderId;
             else if (_gs.activePlayers.Count > 0) winnerId = _gs.activePlayers[0];
         }
+
         if (CheckShootout()) return;
         if (CheckGameOver()) return;
         if (!string.IsNullOrEmpty(winnerId) && _gs.activePlayers.Contains(winnerId))
@@ -939,11 +653,17 @@ public class GameManager : MonoBehaviour
         {
             if (GetSuit(pc.card) != _gs.leadSuit) continue;
             int rank = GetRankValue(pc.card);
-            if (rank > highestRank) { highestRank = rank; pickupId = pc.playerId; }
+            if (rank > highestRank)
+            {
+                highestRank = rank;
+                pickupId = pc.playerId;
+            }
         }
-        Debug.Log($"[GameManager] Thulla! {pickupId} picks up {_gs.cardsInPlay.Count} cards.");
+
+        FlushRoundLog(isThulla: true, pickupId: pickupId);
         if (!string.IsNullOrEmpty(pickupId) && _gs.hands.ContainsKey(pickupId))
-            foreach (var pc in _gs.cardsInPlay) _gs.hands[pickupId].Add(pc.card);
+            foreach (var pc in _gs.cardsInPlay)
+                _gs.hands[pickupId].Add(pc.card);
         _gs.cardsInPlay.Clear();
         _gs.leadSuit = "";
         CheckForNewWinners();
@@ -954,10 +674,208 @@ public class GameManager : MonoBehaviour
             _myHand = new List<string>(_gs.hands[pickupId]);
             EventManager.FireLocalHandUpdated(new List<string>(_myHand), _gs);
         }
+
         if (CheckShootout()) return;
         if (CheckGameOver()) return;
         _gs.turnStartTime = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         WriteGameStateAndProcess();
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // ── ROUND LOGGER ─────────────────────────────────────────────────────────
+    // Produces one clean Debug.Log per round in this exact format:
+    //
+    //   [ROUND  3] AS (Bot1)  KS (Player1)  JS (Bot2)  10S (Bot3)  → Bot1 leads next
+    //   [ROUND  7] 9H (Bot3)  8H (Bot1)  10D (Player1) ← THULLA    → Player1 PICKS UP 3 cards
+    //
+    // At game end, DumpGameLog() fires one mega-log with every round on its own line
+    // so you can copy-paste the whole game for bot analysis.
+    // ═════════════════════════════════════════════════════════════════════════
+
+    // Stores the hand snapshot string for the CURRENT round (set by LogHandSnapshot,
+    // prepended to the round result line in FlushRoundLog so they stay together in the log).
+    private string _currentHandSnapshot = "";
+
+    /// <summary>
+    /// Captures every player's hand at the very start of a round (before any card is played).
+    /// Fires one Debug.Log immediately AND stores snapshot so DumpGameLog can include it.
+    /// Format:
+    ///   [ROUND  N | HANDS]
+    ///   Player  : AH KH QH 9H 6H 4H 3H 2H
+    ///   Bot1    : 10H 8H 7H
+    ///   Bot2    : KS QD 3C ...
+    /// </summary>
+    private void LogHandSnapshot()
+    {
+        int roundNum = _gs.roundNumber;
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine($"[ROUND {roundNum,2} | HANDS]");
+
+        // Walk seated order so labels match the round log
+        if (_seatedPlayers != null)
+        {
+            foreach (var slot in _seatedPlayers)
+            {
+                if (!_gs.hands.ContainsKey(slot.id)) continue;
+                var hand = _gs.hands[slot.id];
+                if (hand.Count == 0) continue; // player already finished
+
+                string label = LabelOf(slot.id);
+                string cards = string.Join(", ", SortHandForDisplay(hand));
+                sb.Append($"  {label,-10}: {cards}");
+                if (slot.id != _seatedPlayers[_seatedPlayers.Count - 1].id)
+                    sb.AppendLine();
+            }
+        }
+
+        _currentHandSnapshot = sb.ToString();
+        // (snapshot logged as part of rolling DumpGameLog after every round)
+    }
+
+    /// <summary>
+    /// Sorts a hand for display: grouped by suit (S H D C), high-to-low within each suit.
+    /// </summary>
+    private List<string> SortHandForDisplay(List<string> hand)
+    {
+        var sorted = new List<string>(hand);
+        string suitOrder = "SHDC";
+        sorted.Sort((a, b) =>
+        {
+            int sA = suitOrder.IndexOf(GetSuit(a));
+            int sB = suitOrder.IndexOf(GetSuit(b));
+            if (sA != sB) return sA.CompareTo(sB);
+            return GetRankValue(b).CompareTo(GetRankValue(a)); // high first
+        });
+        return sorted;
+    }
+
+    /// <summary>
+    /// Called at the end of every round (clean or thulla).
+    /// Builds the formatted round string, appends to _roundLog, and Debug.Logs it.
+    /// Also clears _currentRoundBuffer ready for the next round.
+    /// </summary>
+    private void FlushRoundLog(bool isThulla, string pickupId)
+    {
+        if (_currentRoundBuffer.Count == 0) return;
+
+        int roundNum = _gs.roundNumber; // still the OLD round number (not yet incremented)
+
+        var sb = new System.Text.StringBuilder();
+        sb.Append($"[ROUND {roundNum,2}] ");
+
+        // Build card list — mark the thulla card with ← THULLA
+        for (int i = 0; i < _currentRoundBuffer.Count; i++)
+        {
+            var (pid, card, _) = _currentRoundBuffer[i];
+            bool isThullaCard = isThulla && i == _currentRoundBuffer.Count - 1;
+
+            sb.Append($"{card} ({LabelOf(pid)})");
+            if (isThullaCard) sb.Append(" ← THULLA");
+            if (i < _currentRoundBuffer.Count - 1) sb.Append("  ");
+        }
+
+        // Outcome suffix
+        if (isThulla)
+        {
+            int cardCount = _currentRoundBuffer.Count; // all cards go to pickup player
+            string pickupLabel = LabelOf(pickupId);
+            sb.Append($"    → {pickupLabel} PICKS UP {cardCount} card{(cardCount == 1 ? "" : "s")}");
+
+            // Also log the pickup player's new hand size for context
+            if (_gs.hands.ContainsKey(pickupId))
+                sb.Append($" (hand now {_gs.hands[pickupId].Count + cardCount})");
+        }
+        else
+        {
+            string winLabel = LabelOf(pickupId);
+            sb.Append($"    → {winLabel} leads next");
+        }
+
+        string line = sb.ToString();
+        // Store snapshot + play result as one paired block in the full game log
+        _roundLog.Add(_currentHandSnapshot);
+        _roundLog.Add(line);
+        _currentHandSnapshot = "";
+        DumpGameLog(); // rolling dump — prints ALL rounds so far after every round
+
+        _currentRoundBuffer.Clear();
+    }
+
+    /// <summary>
+    /// Maps a player id to a human-readable label: "Player1", "Bot1", "Bot2", etc.
+    /// Uses _seatedPlayers seat order so labels are consistent throughout the game.
+    /// Falls back to a short id slice if seating data is unavailable.
+    /// </summary>
+    private string LabelOf(string pid)
+    {
+        if (string.IsNullOrEmpty(pid)) return "?";
+
+        // Try to find in seated players list (preserves original seat order)
+        if (_seatedPlayers != null && _seatedPlayers.Count > 0)
+        {
+            int botCount = 0;
+            int humanCount = 0;
+            foreach (var slot in _seatedPlayers)
+            {
+                if (slot.isBot) botCount++;
+                else humanCount++;
+
+                if (slot.id == pid)
+                {
+                    // Assign label based on type + how many of that type came before
+                    int seatBot = 0;
+                    int seatHuman = 0;
+                    foreach (var s2 in _seatedPlayers)
+                    {
+                        if (s2.id == pid) break;
+                        if (s2.isBot) seatBot++;
+                        else seatHuman++;
+                    }
+
+                    return slot.isBot
+                        ? $"Bot{seatBot + 1}"
+                        : (humanCount == 1 ? "Player" : $"Player{seatHuman + 1}");
+                }
+            }
+        }
+
+        // Fallback: derive from id prefix
+        if (pid.StartsWith("BOT_")) return pid.Replace("BOT_", "Bot");
+        return pid.Length > 6 ? pid.Substring(0, 6) : pid;
+    }
+
+    /// <summary>
+    /// Dumps the complete game log as a single Debug.Log.
+    /// Call this at game-over so you can copy the whole game in one block.
+    /// Format:
+    ///   ══════ GAME LOG (13 rounds) ══════
+    ///   [ROUND  1] ...
+    ///   [ROUND  2] ...
+    ///   ...
+    ///   ══════ END ══════
+    /// </summary>
+    private void DumpGameLog()
+    {
+        if (_roundLog.Count == 0) return;
+
+        // Each round contributes 2 entries: a HANDS snapshot + a ROUND result line.
+        // So actual rounds played = _roundLog.Count / 2.
+        int roundsPlayed = _roundLog.Count / 2;
+
+        var sb = new System.Text.StringBuilder();
+        sb.AppendLine($"══════ GAME LOG — {roundsPlayed} round{(roundsPlayed == 1 ? "" : "s")} played ══════");
+
+        for (int i = 0; i < _roundLog.Count; i += 2)
+        {
+            // Entry i   = HANDS snapshot for this round
+            // Entry i+1 = ROUND play result
+            if (i < _roundLog.Count) sb.AppendLine(_roundLog[i]); // hands
+            if (i + 1 < _roundLog.Count) sb.AppendLine(_roundLog[i + 1]); // round result
+            if (i + 2 < _roundLog.Count) sb.AppendLine(); // blank line between rounds
+        }
+
+        sb.Append("══════ END ══════");
+        Debug.Log($"[GameLog]\n{sb}");
     }
 
     private void CheckForNewWinners()
@@ -966,9 +884,15 @@ public class GameManager : MonoBehaviour
         foreach (var pid in _gs.activePlayers)
             if (_gs.hands.ContainsKey(pid) && _gs.hands[pid].Count == 0)
             {
-                if (!_gs.winners.Contains(pid)) { _gs.winners.Add(pid); Debug.Log($"[GameManager] {pid} won!"); }
+                if (!_gs.winners.Contains(pid))
+                {
+                    _gs.winners.Add(pid);
+                    Debug.Log($"[GameManager] {pid} won!");
+                }
+
                 toRemove.Add(pid);
             }
+
         foreach (var pid in toRemove) _gs.activePlayers.Remove(pid);
         AdjustCurrentIndexAfterRemoval();
     }
@@ -976,20 +900,39 @@ public class GameManager : MonoBehaviour
     private bool CheckGameOver()
     {
         if (_gs.activePlayers.Count > 1) return false;
-        if (_gs.activePlayers.Count == 1) { _gs.bhabhi = _gs.activePlayers[0]; _gs.activePlayers.Clear(); Debug.Log($"[GameManager] Bhabhi: {_gs.bhabhi}"); }
-        else { if (_gs.winners.Count > 0) _gs.bhabhi = _gs.winners[_gs.winners.Count - 1]; }
+        if (_gs.activePlayers.Count == 1)
+        {
+            _gs.bhabhi = _gs.activePlayers[0];
+            _gs.activePlayers.Clear();
+            Debug.Log($"[GameManager] Bhabhi: {_gs.bhabhi}");
+        }
+        else
+        {
+            if (_gs.winners.Count > 0) _gs.bhabhi = _gs.winners[_gs.winners.Count - 1];
+        }
+
         _gs.phase = GameState.PhaseFinished;
-        WriteGameState(() => { EventManager.FireGameStateUpdated(_gs); HandleGameFinished(); });
+        WriteGameState(() =>
+        {
+            EventManager.FireGameStateUpdated(_gs);
+            HandleGameFinished();
+        });
         return true;
     }
 
     private void CheckGameOverWithBhabhi(string forcedBhabhi)
     {
-        _gs.bhabhi = string.IsNullOrEmpty(forcedBhabhi) && _gs.winners.Count > 0 ? _gs.winners[_gs.winners.Count - 1] : forcedBhabhi;
+        _gs.bhabhi = string.IsNullOrEmpty(forcedBhabhi) && _gs.winners.Count > 0
+            ? _gs.winners[_gs.winners.Count - 1]
+            : forcedBhabhi;
         _gs.activePlayers.Clear();
         Debug.Log($"[GameManager] All ran out. Bhabhi: {_gs.bhabhi}");
         _gs.phase = GameState.PhaseFinished;
-        WriteGameState(() => { EventManager.FireGameStateUpdated(_gs); HandleGameFinished(); });
+        WriteGameState(() =>
+        {
+            EventManager.FireGameStateUpdated(_gs);
+            HandleGameFinished();
+        });
     }
 
     private bool CheckShootout()
@@ -997,7 +940,12 @@ public class GameManager : MonoBehaviour
         if (_gs.activePlayers.Count != 2) return false;
         string zeroCardId = "";
         foreach (var pid in _gs.activePlayers)
-            if (_gs.hands.ContainsKey(pid) && _gs.hands[pid].Count == 0) { zeroCardId = pid; break; }
+            if (_gs.hands.ContainsKey(pid) && _gs.hands[pid].Count == 0)
+            {
+                zeroCardId = pid;
+                break;
+            }
+
         if (string.IsNullOrEmpty(zeroCardId)) return false;
         _gs.phase = GameState.PhaseShootout;
         _gs.shootoutDrawerId = zeroCardId;
@@ -1009,8 +957,14 @@ public class GameManager : MonoBehaviour
 
     private void HandleGameFinished()
     {
-        _gameActive = false; _isExecutingMove = false; _lastProcessedTurnKey = -1;
-        StopTurnTimer(); StopBotCoroutine(); StopResolveCoroutine(); StopListener();
+        _gameActive = false;
+        _isExecutingMove = false;
+        _lastProcessedTurnKey = -1;
+        StopTurnTimer();
+        StopBotCoroutine();
+        StopResolveCoroutine();
+        StopListener();
+        DumpGameLog();
         if (_isHost) EventManager.FireAwardGameCoinsRequested(_gs.winners, Mathf.RoundToInt(_room.entryFee * 1.25f));
         EventManager.FireGameFinished(_gs.winners, _gs.bhabhi);
     }
@@ -1022,19 +976,41 @@ public class GameManager : MonoBehaviour
         AutoPlay(botId);
     }
 
-    private void StopBotCoroutine() { if (_botCoroutine != null) { StopCoroutine(_botCoroutine); _botCoroutine = null; } }
-    private void StopResolveCoroutine() { if (_resolveCoroutine != null) { StopCoroutine(_resolveCoroutine); _resolveCoroutine = null; } }
+    private void StopBotCoroutine()
+    {
+        if (_botCoroutine != null)
+        {
+            StopCoroutine(_botCoroutine);
+            _botCoroutine = null;
+        }
+    }
+
+    private void StopResolveCoroutine()
+    {
+        if (_resolveCoroutine != null)
+        {
+            StopCoroutine(_resolveCoroutine);
+            _resolveCoroutine = null;
+        }
+    }
+
     private bool IsBot(string id) => id != null && id.StartsWith("BOT_");
 
     private string GetSecondHighestSuitCardPlayer(string excludeId, string leadSuit, List<PlayedCard> snapshot)
     {
-        string bestId = ""; int bestRank = -1;
+        string bestId = "";
+        int bestRank = -1;
         foreach (var pc in snapshot)
         {
             if (pc.playerId == excludeId || GetSuit(pc.card) != leadSuit) continue;
             int rank = GetRankValue(pc.card);
-            if (rank > bestRank) { bestRank = rank; bestId = pc.playerId; }
+            if (rank > bestRank)
+            {
+                bestRank = rank;
+                bestId = pc.playerId;
+            }
         }
+
         return (!string.IsNullOrEmpty(bestId) && _gs.activePlayers.Contains(bestId)) ? bestId : "";
     }
 
@@ -1044,29 +1020,52 @@ public class GameManager : MonoBehaviour
     {
         if (string.IsNullOrEmpty(code)) return 0;
         string rankStr = code.Substring(0, code.Length - 1);
-        switch (rankStr) { case "A": return 14; case "K": return 13; case "Q": return 12; case "J": return 11; default: return int.TryParse(rankStr, out int v) ? v : 0; }
+        switch (rankStr)
+        {
+            case "A": return 14;
+            case "K": return 13;
+            case "Q": return 12;
+            case "J": return 11;
+            default: return int.TryParse(rankStr, out int v) ? v : 0;
+        }
     }
 
-    private void AdvanceToNextPlayer() { if (_gs.activePlayers.Count == 0) return; _gs.currentPlayerIndex = (_gs.currentPlayerIndex + 1) % _gs.activePlayers.Count; }
+    private void AdvanceToNextPlayer()
+    {
+        if (_gs.activePlayers.Count == 0) return;
+        _gs.currentPlayerIndex = (_gs.currentPlayerIndex + 1) % _gs.activePlayers.Count;
+    }
 
     private void AdjustCurrentIndexAfterRemoval()
     {
-        if (_gs.activePlayers.Count == 0) { _gs.currentPlayerIndex = 0; return; }
+        if (_gs.activePlayers.Count == 0)
+        {
+            _gs.currentPlayerIndex = 0;
+            return;
+        }
+
         _gs.currentPlayerIndex = _gs.currentPlayerIndex % _gs.activePlayers.Count;
     }
 
-    private string GetPlayerIdAt(int index) { if (_gs.activePlayers.Count == 0) return ""; return _gs.activePlayers[index % _gs.activePlayers.Count]; }
+    private string GetPlayerIdAt(int index)
+    {
+        if (_gs.activePlayers.Count == 0) return "";
+        return _gs.activePlayers[index % _gs.activePlayers.Count];
+    }
 
     private string GetNextActivePlayerLeft(string fromId)
     {
         if (_gs.activePlayers.Count <= 1) return "";
-        var allIds = new List<string>(); foreach (var p in _room.players) allIds.Add(p.id);
-        int fromIdx = allIds.IndexOf(fromId); if (fromIdx < 0) return "";
+        var allIds = new List<string>();
+        foreach (var p in _room.players) allIds.Add(p.id);
+        int fromIdx = allIds.IndexOf(fromId);
+        if (fromIdx < 0) return "";
         for (int i = 1; i < allIds.Count; i++)
         {
             string candidate = allIds[(fromIdx + i) % allIds.Count];
             if (_gs.activePlayers.Contains(candidate) && candidate != fromId) return candidate;
         }
+
         return "";
     }
 
@@ -1101,7 +1100,12 @@ public class GameManager : MonoBehaviour
     /// </summary>
     private void WriteGameState(Action onComplete = null)
     {
-        if (_room == null) { onComplete?.Invoke(); return; }
+        if (_room == null)
+        {
+            onComplete?.Invoke();
+            return;
+        }
+
         _ = WriteGameStateAndInvokeAsync(onComplete);
     }
 
@@ -1142,7 +1146,10 @@ public class GameManager : MonoBehaviour
 
     private void HandleLeaveGame()
     {
-        _gameActive = false; _isExecutingMove = false; _lastProcessedTurnKey = -1;
-        StopAllCoroutines(); StopListener();
+        _gameActive = false;
+        _isExecutingMove = false;
+        _lastProcessedTurnKey = -1;
+        StopAllCoroutines();
+        StopListener();
     }
 }
