@@ -6,4 +6,6 @@
 
 // Add this method to PlayFabManager class:
 
-    
+/*
+
+*/
