@@ -112,7 +112,7 @@ public class InGameManager : MonoBehaviour
                 hand.Add(deck[c].ToFirestoreString());
 
             _room.hands[safeKey]    = hand;
-            _room.players[i].id    = safeKey;
+            // _room.players[i].id    = safeKey;
         }
 
         Debug.Log($"[InGameManager] Dealt cards to {_room.hands.Count} players: " +

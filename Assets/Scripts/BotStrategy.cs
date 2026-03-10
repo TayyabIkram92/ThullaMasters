@@ -1,9 +1,16 @@
 // ============================================================
 //  BotStrategy.cs  —  Hard-Bot AI for Thulla / Bhabhi
-//  Implements the full strategic algorithm from BotStrategy_cs.txt
+//
+//  Implements the complete pseudo-code algorithm including:
+//    • First-turn logic
+//    • Leading logic  (Rules 0-4 + LeadChainSafe look-ahead)
+//    • Following logic (same rules + LeadChainSafe look-ahead)
+//    • Discard algorithm
+//    • LeadChainSafe: multi-round look-ahead that lets the bot
+//      willingly burn high cards (AS/KS/QS…) when it can see
+//      a future trap waiting at the end of the chain.
 // ============================================================
 
-using System;
 using System.Collections.Generic;
 using System.Linq;
 using UnityEngine;
@@ -14,141 +21,182 @@ using UnityEngine;
 /// </summary>
 public class BotStrategy
 {
-    // ── Discard tracking ────────────────────────────────────────────────────
-    // Maps playerId → set of suits the player is known to be void in.
+    // ── Tracking state ───────────────────────────────────────────────────────
+    // pid → suits the player is confirmed void in (played out-of-suit before)
     private readonly Dictionary<string, HashSet<string>> _knownVoids
         = new Dictionary<string, HashSet<string>>();
 
-    // Cards confirmed gone from the game (clean-round discards).
+    // Cards confirmed out of the game via clean-round discards
     private readonly HashSet<string> _discardPile = new HashSet<string>();
 
-    // ── Public API ──────────────────────────────────────────────────────────
+    // ALL cards that have been played in any round (clean discard OR Thulla/out-of-suit).
+    // Used to skip swapping cards that opponents have already seen — no point
+    // upgrading to a card that is publicly known.
+    private readonly HashSet<string> _knownCards = new HashSet<string>();
 
-    /// <summary>Reset all learned state at the start of a new game.</summary>
+    // Maximum look-ahead depth for LeadChainSafe to avoid infinite loops
+    private const int MaxChainDepth = 10;
+
+    // ── Public API ───────────────────────────────────────────────────────────
+
     public void Reset()
     {
         _knownVoids.Clear();
         _discardPile.Clear();
+        _knownCards.Clear();
     }
 
     /// <summary>
-    /// Called by GameManager after every card is played so the bot can learn
-    /// about voids (when a player plays out-of-suit = Thulla).
+    /// Called after every card is played so the bot learns about voids.
+    /// A player who breaks suit is confirmed void in the lead suit.
+    /// Every played card — in-suit or out-of-suit — is added to _knownCards.
     /// </summary>
     public void RecordMove(GameState gs, string playerId, string cardCode)
     {
-        if (string.IsNullOrEmpty(gs.leadSuit)) return;          // first card of round, no lead yet
-        string suit = GetSuit(cardCode);
-        if (suit != gs.leadSuit)
-        {
-            // Player had to break suit → they are void in leadSuit
+        // Track ALL played cards as known (seen by everyone at the table)
+        if (!string.IsNullOrEmpty(cardCode))
+            _knownCards.Add(cardCode);
+
+        if (string.IsNullOrEmpty(gs.leadSuit)) return;
+        if (GetSuit(cardCode) != gs.leadSuit)
             EnsureVoids(playerId).Add(gs.leadSuit);
-        }
     }
 
     /// <summary>
-    /// Called when a player picks up a Thulla pile so we can track the new
-    /// cards in their hand (useful for future opponent-modelling).
-    /// Currently records the event; extend as needed.
+    /// Called when a player picks up a Thulla pile.
+    /// They may have regained cards of suits we thought they were void in.
     /// </summary>
     public void RecordPickup(GameState gs, string playerId, List<string> cards)
     {
-        // If the player just received cards back, they are no longer guaranteed
-        // void in that suit (the pile may include that suit).
-        // Simple conservative approach: clear their void flags for any suit
-        // present in the cards they picked up.
         if (!_knownVoids.ContainsKey(playerId)) return;
         foreach (var c in cards)
             _knownVoids[playerId].Remove(GetSuit(c));
     }
 
-    /// <summary>Main decision entry-point called by GameManager.AutoPlay.</summary>
+    /// <summary>
+    /// Called after a clean round so we know those cards are gone forever.
+    /// All discarded cards are added to both _discardPile and _knownCards.
+    /// </summary>
+    public void RecordDiscard(List<string> cards)
+    {
+        foreach (var c in cards)
+        {
+            _discardPile.Add(c);
+            _knownCards.Add(c);  // also mark as seen/known
+        }
+    }
+
+    /// <summary>Returns true if this card has already been played in any round.</summary>
+    public bool IsKnownCard(string card) => _knownCards.Contains(card);
+
+    /// <summary>Main entry point called by GameManager.AutoPlay.</summary>
     public string ChooseCard(GameState gs, string botId, List<string> hand)
     {
         if (hand == null || hand.Count == 0) return null;
 
-        bool isFirstTurn = gs.roundNumber == 1;
-        bool isLeading   = string.IsNullOrEmpty(gs.leadSuit);
+        // ── 3-PLAYER BOT STEAL ───────────────────────────────────────────────
+        // When exactly 3 players remain, this bot is leading (no lead suit yet),
+        // and the very next active player is ALSO a bot — steal their hand.
+        //
+        // Why: two bots + one human left. If the leading bot steals the other
+        // bot's hand, the stolen bot exits as a winner and we go straight to
+        // a clean 1-bot vs 1-human endgame. The stolen cards are added to this
+        // bot's hand by ExecuteSteal in GameManager (same as the normal steal
+        // path — AutoPlay already handles the "STEAL" return value).
+        //
+        // Conditions:
+        //   1. Exactly 3 active players remain.
+        //   2. Bot is currently leading (no lead suit — start of a round).
+        //   3. The next active player is a bot (not a human).
+        //
+        // Example:
+        //   Active: [BotA(leading), BotB, Human]
+        //   BotA is in lead, 3 players left, next = BotB (bot).
+        //   → Return "STEAL". GameManager calls ExecuteSteal(BotA).
+        //   → BotB exits as winner. BotA absorbs BotB's cards.
+        //   → 2 players left: BotA vs Human. Normal game resumes.
+        if (gs.activePlayers.Count == 3 && string.IsNullOrEmpty(gs.leadSuit))
+        {
+            int myIndex = gs.activePlayers.IndexOf(botId);
+            if (myIndex >= 0)
+            {
+                string nextId = gs.activePlayers[(myIndex + 1) % gs.activePlayers.Count];
+                bool nextIsBot = nextId != null && nextId.StartsWith("BOT_");
+                if (nextIsBot)
+                {
+                    Debug.Log($"[BotStrategy] 3-player steal: {botId} steals from {nextId}");
+                    return "STEAL";
+                }
+            }
+        }
 
-        // ── FIRST TURN LOGIC ─────────────────────────────────────────────────
-        if (isFirstTurn)
+        if (gs.roundNumber == 1)
             return ChooseFirstTurnCard(gs, botId, hand);
 
-        // ── NORMAL PLAY ──────────────────────────────────────────────────────
-        if (isLeading)
-            return ChooseLeadCard(gs, botId, hand);
-        else
-            return ChooseFollowCard(gs, botId, hand);
+        bool isLeading = string.IsNullOrEmpty(gs.leadSuit);
+        return isLeading
+            ? LeadingLogic(gs, botId, hand)
+            : FollowingLogic(gs, botId, hand);
     }
 
-    // ── FIRST TURN ───────────────────────────────────────────────────────────
+    // ═══════════════════════════════════════════════════════════════════════
+    //  FIRST TURN
+    // ═══════════════════════════════════════════════════════════════════════
 
     private string ChooseFirstTurnCard(GameState gs, string botId, List<string> hand)
     {
-        // First card of the whole game (round 1, no cards in play yet)
-        if (gs.cardsInPlay.Count == 0)
-        {
-            // Must play AS if we have it
-            if (hand.Contains("AS")) return "AS";
-        }
+        // Must play AS if leading and holding it
+        if (gs.cardsInPlay.Count == 0 && hand.Contains("AS"))
+            return "AS";
 
-        // Round 1, following someone else's lead
         var spades = hand.Where(c => GetSuit(c) == "S").ToList();
         if (spades.Count > 0)
-        {
-            if (spades.Count == 1) return spades[0];
-            return HighestCard(spades);
-        }
+            return spades.Count == 1 ? spades[0] : HighestCard(spades);
 
-        // No spades → discard using the lowest-suit algorithm
         return DiscardUsingLowestSuitAlgorithm(hand, "S");
     }
 
-    // ── LEADING ──────────────────────────────────────────────────────────────
+    // ═══════════════════════════════════════════════════════════════════════
+    //  LEADING LOGIC
+    // ═══════════════════════════════════════════════════════════════════════
 
-    private string ChooseLeadCard(GameState gs, string botId, List<string> hand)
+    private string LeadingLogic(GameState gs, string botId, List<string> hand)
     {
-        var activePlayers = gs.activePlayers;
-        int myIndex       = activePlayers.IndexOf(botId);
+        var active   = gs.activePlayers;
+        int myIndex  = active.IndexOf(botId);
         if (myIndex < 0) return hand[0];
 
-        string nextId   = activePlayers[(myIndex + 1) % activePlayers.Count];
-        string secondId = activePlayers[(myIndex + 2) % activePlayers.Count];
+        string nextId   = active[(myIndex + 1) % active.Count];
+        string secondId = active.Count >= 3 ? active[(myIndex + 2) % active.Count] : null;
 
-        // ── RULE 0 : Find dominant suits ──────────────────────────────────────
-        var dominantSuits = new HashSet<string>();
-        foreach (string s in AllSuits)
-        {
-            int remaining = 13 - DiscardedCount(s);
-            int myCount   = hand.Count(c => GetSuit(c) == s);
-            if (myCount >= remaining - 1)
-                dominantSuits.Add(s);
-        }
+        // ── Rule 0 : Dominant suits ──────────────────────────────────────────
+        var dominantSuits = BuildDominantSuits(hand);
 
-        // Sort hand highest-to-lowest for searching
         var sortedHand = hand.OrderByDescending(GetRankValue).ToList();
 
-        // ── RULE 1 : Clean round (all players have suit) ──────────────────────
+        // ── Rule 1 : Clean round ─────────────────────────────────────────────
         foreach (var card in sortedHand)
         {
             string suit = GetSuit(card);
             if (dominantSuits.Contains(suit)) continue;
             if (AllActivePlayers_HaveSuit(gs, botId, suit))
-                return card;
+                if (LeadChainSafe(gs, botId, card, 0))
+                    return card;
         }
 
-        // ── RULE 2 : Trap next player ─────────────────────────────────────────
+        // ── Rule 2 : Trap next player ────────────────────────────────────────
         foreach (var card in sortedHand)
         {
             string suit = GetSuit(card);
             if (dominantSuits.Contains(suit)) continue;
             if (!PlayerHasSuit(gs, nextId, suit)) continue;
             if (PlayerHasGreaterCard(gs, nextId, card) && !PlayerHasLowerCard(gs, nextId, card))
-                return card;
+                if (LeadChainSafe(gs, botId, card, 0))
+                    return card;
         }
 
-        // ── RULE 3 : Trap second player ───────────────────────────────────────
-        if (activePlayers.Count >= 3)
+        // ── Rule 3 : Trap second player ──────────────────────────────────────
+        if (secondId != null)
         {
             foreach (var card in sortedHand)
             {
@@ -159,120 +207,556 @@ public class BotStrategy
                 {
                     if (!PlayerHasSuit(gs, secondId, suit)) continue;
                     if (PlayerHasGreaterCard(gs, secondId, card) && !PlayerHasLowerCard(gs, secondId, card))
-                        return card;
+                        if (LeadChainSafe(gs, botId, card, 0))
+                            return card;
                 }
             }
         }
 
-        // ── RULE 4 : Smart fallback — feed card under opponent's high card ─────
+        // ── Rule 4 : Smart fallback — feed under opponent's high card ────────
         foreach (var card in sortedHand)
         {
             string suit = GetSuit(card);
             if (!PlayerHasSuit(gs, nextId, suit)) continue;
             if (PlayerHasGreaterCard(gs, nextId, card))
-                return card;
+                if (LeadChainSafe(gs, botId, card, 0))
+                    return card;
         }
 
-        // Ultimate fallback: lowest card
-        return LowestCard(hand);
+        // ── Final fallback ───────────────────────────────────────────────────
+        string leadDiscard = DiscardUsingLowestSuitAlgorithm(hand, "");
+        return UpgradeDiscardWithOtherBots(gs, botId, leadDiscard);
     }
 
-    // ── FOLLOWING ─────────────────────────────────────────────────────────────
+    // ═══════════════════════════════════════════════════════════════════════
+    //  FOLLOWING LOGIC
+    // ═══════════════════════════════════════════════════════════════════════
 
-    private string ChooseFollowCard(GameState gs, string botId, List<string> hand)
+    private string FollowingLogic(GameState gs, string botId, List<string> hand)
     {
+        // ══════════════════════════════════════════════════════════════════
+        //  FOLLOWING LOGIC — COMPLETE PRIORITY ORDER
+        //
+        //  Core principle: we NEVER want to win this trick and get the lead.
+        //  The highest card already on the table is the real ceiling — not
+        //  just what the next player holds.
+        //
+        //  STEP 0 — Find the current highest card on the table (in leadSuit).
+        //           This is the "table ceiling". If we play anything below it
+        //           we are 100% guaranteed NOT to win this trick.
+        //
+        //  STEP 1 — SAFE DUMP (highest priority)
+        //           If we have any card strictly below the table ceiling,
+        //           find the HIGHEST such card. Dump it. We lose no lead,
+        //           we remove our strongest possible card safely.
+        //
+        //           Example from screenshot:
+        //             AH is on the table (rank 14) — table ceiling = 14.
+        //             Aryan has KH (rank 13). KH < 14 → safe dump.
+        //             → Play KH immediately. KH is gone, AH holder wins.
+        //
+        //           Example 2:
+        //             10H on table. We have QH 9H 5H. Next has KH.
+        //             Table ceiling = 10. Our cards below 10: 9H, 5H.
+        //             → Play 9H (highest below ceiling). Safe dump.
+        //
+        //  STEP 2 — TRAP via next player (if no safe dump exists)
+        //           All our cards are >= table ceiling (we WILL win unless
+        //           someone after us beats us). So check: does the next
+        //           player have ONLY higher cards of this suit? If yes,
+        //           they will beat us → we can play our highest and still
+        //           not end up with lead. LeadChainSafe check applies.
+        //
+        //  STEP 3 — TRAP via second player (if next player has mixed cards)
+        //           Next player has both higher and lower cards of suit.
+        //           Check if the second-next player has ONLY higher cards.
+        //           If yes, second player will beat us → safe to play.
+        //
+        //  STEP 4 — LAST RESORT
+        //           No safe dump, no trap. We WILL win this trick no matter
+        //           what. Play the LOWEST card of the suit to minimise the
+        //           damage (preserve higher cards for future traps).
+        // ══════════════════════════════════════════════════════════════════
+
         string leadSuit = gs.leadSuit;
-        var activePlayers = gs.activePlayers;
-        int myIndex       = activePlayers.IndexOf(botId);
+        var active      = gs.activePlayers;
+        int myIndex     = active.IndexOf(botId);
         if (myIndex < 0) return hand[0];
 
-        string nextId   = activePlayers[(myIndex + 1) % activePlayers.Count];
-        string secondId = activePlayers.Count >= 3
-            ? activePlayers[(myIndex + 2) % activePlayers.Count]
-            : null;
+        string nextId   = active[(myIndex + 1) % active.Count];
+        string secondId = active.Count >= 3 ? active[(myIndex + 2) % active.Count] : null;
 
-        var suitCards = hand.Where(c => GetSuit(c) == leadSuit).OrderByDescending(GetRankValue).ToList();
+        var suitCards = hand.Where(c => GetSuit(c) == leadSuit)
+                            .OrderByDescending(GetRankValue).ToList();
 
         if (suitCards.Count > 0)
         {
-            // Follow same suit with adapted trap logic
+            // ── STEP 0: Find table ceiling ───────────────────────────────────
+            // Highest card of leadSuit already played this trick
+            int tableCeiling = 0;
+            foreach (var pc in gs.cardsInPlay)
+                if (GetSuit(pc.card) == leadSuit)
+                    tableCeiling = System.Math.Max(tableCeiling, GetRankValue(pc.card));
 
-            // Rule 1 mirror: all players have suit
-            foreach (var card in suitCards)
+            // ── STEP 1A: 4-player clean round — play HIGHEST card ───────────
+            //
+            // Special case: exactly 4 active players remain AND every player
+            // still has cards of the lead suit → this is guaranteed to be a
+            // clean discard round (all cards leave the game, no one picks up).
+            // In this case play our ABSOLUTE HIGHEST card of the suit — there
+            // is zero risk because every card gets discarded regardless of rank.
+            //
+            // Example:
+            //   4 players active. Lead suit = H. All 4 have hearts.
+            //   We have QH JH 7H. Table ceiling = 10H.
+            //   Normal logic would play 7H (below ceiling).
+            //   But it's a guaranteed clean round → play QH instead.
+            //   QH gets discarded cleanly. Much better value.
+            if (gs.activePlayers.Count == 4 &&
+                AllActivePlayers_HaveSuit(gs, botId, leadSuit))
             {
-                if (AllActivePlayers_HaveSuit(gs, botId, leadSuit))
-                    return card;
+                // Play highest card of suit — entire round discards cleanly
+                return suitCards[0];
             }
 
-            // Rule 2 mirror: trap next player
-            foreach (var card in suitCards)
+            // ── STEP 1B: Safe Dump — play highest card below table ceiling ───
+            //
+            // Any card we play below the ceiling cannot win the trick.
+            // Pick the HIGHEST such card to dump our strongest safe card.
+            //
+            // AH on table (ceiling=14), we have KH(13) QH(12) 9H(9)
+            //   → All three are below 14 → play KH (highest safe dump).
+            //
+            // 10H on table (ceiling=10), we have QH(12) 9H(9) 5H(5)
+            //   → Below 10: 9H, 5H → play 9H.
+            if (tableCeiling > 0)
             {
+                var safeDumps = suitCards.Where(c => GetRankValue(c) < tableCeiling).ToList();
+                // suitCards is already sorted highest→lowest, so safeDumps[0] is the best dump
+                if (safeDumps.Count > 0)
+                    return safeDumps[0];
+            }
+
+            // ── STEP 2: Trap next player ─────────────────────────────────────
+            //
+            // No safe dump exists (all our cards >= ceiling, or no card on table yet).
+            // Check: does next player have ONLY higher cards of this suit?
+            // If yes → they will beat whatever we play → not our problem.
+            //
+            // We have QH(12). Next has KH(13) only (no lower H).
+            //   → Next has greater(QH)=true, no lower(QH)=true → play QH.
+            foreach (var card in suitCards)
                 if (PlayerHasGreaterCard(gs, nextId, card) && !PlayerHasLowerCard(gs, nextId, card))
-                    return card;
-            }
+                    if (LeadChainSafe(gs, botId, card, 0))
+                        return card;
 
-            // Rule 3 mirror: trap second player
+            // ── STEP 3: Trap second player ───────────────────────────────────
+            //
+            // Next player has mixed cards (some higher, some lower than ours).
+            // They might or might not beat us. Check the second-next player:
+            // if they have ONLY higher cards, they guarantee the trick goes to them.
+            //
+            // We have 9H. Next has QH and 6H (mixed). Second has AH only.
+            //   → Next: greater(9H)=true, lower(9H)=true → mixed, skip Rule 2.
+            //   → Second: greater(9H)=true, no lower(9H)=true → play 9H.
             if (secondId != null)
-            {
                 foreach (var card in suitCards)
-                {
                     if (PlayerHasGreaterCard(gs, nextId, card) && PlayerHasLowerCard(gs, nextId, card))
-                    {
                         if (PlayerHasGreaterCard(gs, secondId, card) && !PlayerHasLowerCard(gs, secondId, card))
-                            return card;
-                    }
-                }
-            }
+                            if (LeadChainSafe(gs, botId, card, 0))
+                                return card;
 
-            // Fallback: play lowest of lead suit (safest discard)
+            // ── STEP 4: Last resort — play lowest to minimise damage ─────────
+            //
+            // We cannot avoid winning this trick. Play the LOWEST card of the
+            // suit to preserve higher cards for future trap opportunities.
+            //
+            // We have QH JH 8H. Nobody has a higher H. We will win no matter what.
+            //   → Play 8H. Keep QH and JH for leading/trapping later.
             return suitCards.Last();
         }
 
-        // ── NO LEAD SUIT ─ Discard Algorithm ──────────────────────────────────
-        return DiscardUsingLowestSuitAlgorithm(hand, leadSuit);
+        // No lead suit → discard, then upgrade the chosen card with other bots
+        string discardCard = DiscardUsingLowestSuitAlgorithm(hand, leadSuit);
+        return UpgradeDiscardWithOtherBots(gs, botId, discardCard);
     }
 
-    // ── DISCARD ALGORITHM ────────────────────────────────────────────────────
-    // Pick the suit with the fewest cards to exhaust; break ties by highest
-    // total value so we dump valuable cards first.
+    // ═══════════════════════════════════════════════════════════════════════
+    //  LEAD CHAIN SAFE  —  Multi-round look-ahead
+    //
+    //  Question: "If I play this card right now, and I end up with the lead,
+    //             will I always be able to avoid being stuck leading forever
+    //             without a trap card?"
+    //
+    //  Returns TRUE  if the chain eventually reaches a round where the bot
+    //                does NOT win the trick (so someone else leads), OR where
+    //                the bot wins but already has a valid trap card to play.
+    //  Returns FALSE if the chain reaches a round where the bot wins but has
+    //                NO card that can trap any opponent — a dead end.
+    // ═══════════════════════════════════════════════════════════════════════
+
+    private bool LeadChainSafe(GameState gs, string botId, string card, int depth)
+    {
+        // Safety cap — treat very deep chains as safe to avoid stalling
+        if (depth >= MaxChainDepth) return true;
+
+        // Clone state so simulation doesn't touch real game
+        SimState sim = CloneToSim(gs, botId);
+
+        // Simulate playing this card as the lead
+        string trickWinner = SimulateTrick(sim, botId, card);
+
+        // If bot doesn't win this trick → someone else leads next → safe ✅
+        if (trickWinner != botId) return true;
+
+        // Bot wins and leads again — remove the played card from sim hand
+        // (SimulateTrick already removed it; winner's hand is updated in sim)
+
+        List<string> botHandAfter = sim.hands[botId];
+        if (botHandAfter.Count == 0) return true; // bot ran out of cards → won the game
+
+        // Check: can the bot find a trap card from the new lead position?
+        string trapCard = FindTrapCard(sim, botId, botHandAfter);
+
+        if (trapCard != null)
+        {
+            // Bot has a trap card available — recurse to make sure that
+            // trap card itself doesn't lead to another unsafe chain
+            return LeadChainSafe(BuildGameState(sim, gs), botId, trapCard, depth + 1);
+        }
+
+        // Bot leads again but has NO trap card → unsafe ❌
+        return false;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  FIND TRAP CARD
+    //  Returns the best card the bot can lead that will trap an opponent,
+    //  or null if no such card exists in the current hand.
+    // ═══════════════════════════════════════════════════════════════════════
+
+    private string FindTrapCard(SimState sim, string botId, List<string> hand)
+    {
+        var active   = sim.activePlayers;
+        int myIndex  = active.IndexOf(botId);
+        if (myIndex < 0 || active.Count < 2) return null;
+
+        string nextId   = active[(myIndex + 1) % active.Count];
+        string secondId = active.Count >= 3 ? active[(myIndex + 2) % active.Count] : null;
+
+        var dominantSuits = BuildDominantSuitsFromSim(sim, botId, hand);
+        var sortedHand    = hand.OrderByDescending(GetRankValue).ToList();
+
+        // Rule 1: clean-round card
+        foreach (var card in sortedHand)
+        {
+            string suit = GetSuit(card);
+            if (dominantSuits.Contains(suit)) continue;
+            if (SimAllHaveSuit(sim, botId, suit)) return card;
+        }
+
+        // Rule 2: trap next
+        foreach (var card in sortedHand)
+        {
+            string suit = GetSuit(card);
+            if (dominantSuits.Contains(suit)) continue;
+            if (!SimPlayerHasSuit(sim, nextId, suit)) continue;
+            if (SimPlayerHasGreater(sim, nextId, card) && !SimPlayerHasLower(sim, nextId, card))
+                return card;
+        }
+
+        // Rule 3: trap second
+        if (secondId != null)
+        {
+            foreach (var card in sortedHand)
+            {
+                string suit = GetSuit(card);
+                if (dominantSuits.Contains(suit)) continue;
+                if (!SimPlayerHasSuit(sim, nextId, suit)) continue;
+                if (SimPlayerHasGreater(sim, nextId, card) && SimPlayerHasLower(sim, nextId, card))
+                {
+                    if (!SimPlayerHasSuit(sim, secondId, suit)) continue;
+                    if (SimPlayerHasGreater(sim, secondId, card) && !SimPlayerHasLower(sim, secondId, card))
+                        return card;
+                }
+            }
+        }
+
+        // Rule 4: smart fallback (can feed under opponent's high card)
+        foreach (var card in sortedHand)
+        {
+            string suit = GetSuit(card);
+            if (!SimPlayerHasSuit(sim, nextId, suit)) continue;
+            if (SimPlayerHasGreater(sim, nextId, card)) return card;
+        }
+
+        return null; // No trap card found
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  SIMULATION HELPERS
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// <summary>
+    /// Lightweight game-state clone used purely for look-ahead simulation.
+    /// Only copies the data the chain-checker needs.
+    /// </summary>
+    private struct SimState
+    {
+        public List<string>              activePlayers;
+        public Dictionary<string, List<string>> hands;
+        public HashSet<string>           voids; // flat: "pid|suit"
+    }
+
+    private SimState CloneToSim(GameState gs, string botId)
+    {
+        var sim = new SimState
+        {
+            activePlayers = new List<string>(gs.activePlayers),
+            hands         = new Dictionary<string, List<string>>(),
+            voids         = new HashSet<string>()
+        };
+        foreach (var kv in gs.hands)
+            sim.hands[kv.Key] = new List<string>(kv.Value);
+        foreach (var kv in _knownVoids)
+            foreach (var s in kv.Value)
+                sim.voids.Add(kv.Key + "|" + s);
+        return sim;
+    }
+
+    private GameState BuildGameState(SimState sim, GameState original)
+    {
+        // Create a minimal GameState wrapper so LeadChainSafe can recurse
+        // using the same helper methods that take a GameState parameter.
+        var gs = new GameState();
+        gs.activePlayers = new List<string>(sim.activePlayers);
+        foreach (var kv in sim.hands)
+            gs.hands[kv.Key] = new List<string>(kv.Value);
+        gs.roundNumber  = original.roundNumber + 1;
+        gs.leadSuit     = "";
+        gs.cardsInPlay  = new List<PlayedCard>();
+        gs.turnStartTime = original.turnStartTime;
+        gs.phase        = original.phase;
+        gs.winners      = new List<string>(original.winners);
+        gs.bhabhi       = original.bhabhi;
+        return gs;
+    }
+
+    /// <summary>
+    /// Simulate one full trick starting with botId playing leadCard.
+    /// Every other active player plays their best card of the lead suit
+    /// (or their lowest card if void — simulating a Thulla).
+    /// Returns the id of the trick winner (highest lead-suit card player).
+    /// Updates sim.hands by removing played cards.
+    /// </summary>
+    private string SimulateTrick(SimState sim, string botId, string leadCard)
+    {
+        string suit = GetSuit(leadCard);
+        var active  = sim.activePlayers;
+        int myIdx   = active.IndexOf(botId);
+
+        // Remove bot's lead card
+        if (sim.hands.ContainsKey(botId))
+            sim.hands[botId].Remove(leadCard);
+
+        string winnerId   = botId;
+        int    winnerRank = GetRankValue(leadCard);
+
+        // Each other player responds
+        for (int offset = 1; offset < active.Count; offset++)
+        {
+            string pid  = active[(myIdx + offset) % active.Count];
+            if (!sim.hands.ContainsKey(pid) || sim.hands[pid].Count == 0) continue;
+
+            List<string> pHand = sim.hands[pid];
+            var suitCards = pHand.Where(c => GetSuit(c) == suit).ToList();
+
+            string played;
+            if (suitCards.Count > 0)
+            {
+                // Play highest of suit (simplified opponent behaviour)
+                played = HighestCard(suitCards);
+                int rank = GetRankValue(played);
+                if (rank > winnerRank) { winnerRank = rank; winnerId = pid; }
+            }
+            else
+            {
+                // Void — play lowest card (Thulla — stops the trick)
+                played = LowestCard(pHand);
+                // Thulla means highest-suit-card holder picks up — but for
+                // the look-ahead we only care who would lead next, which is
+                // the highest-suit-card player (the bot if no one beat them).
+            }
+
+            pHand.Remove(played);
+        }
+
+        return winnerId;
+    }
+
+    // ── SimState-based player knowledge helpers ──────────────────────────────
+
+    private bool SimPlayerHasSuit(SimState sim, string pid, string suit)
+    {
+        if (sim.voids.Contains(pid + "|" + suit)) return false;
+        if (sim.hands.ContainsKey(pid)) return sim.hands[pid].Any(c => GetSuit(c) == suit);
+        return true;
+    }
+
+    private bool SimAllHaveSuit(SimState sim, string selfId, string suit)
+        => sim.activePlayers.Where(p => p != selfId).All(p => SimPlayerHasSuit(sim, p, suit));
+
+    private bool SimPlayerHasGreater(SimState sim, string pid, string refCard)
+    {
+        if (!sim.hands.ContainsKey(pid)) return false;
+        string suit = GetSuit(refCard); int rank = GetRankValue(refCard);
+        return sim.hands[pid].Any(c => GetSuit(c) == suit && GetRankValue(c) > rank);
+    }
+
+    private bool SimPlayerHasLower(SimState sim, string pid, string refCard)
+    {
+        if (!sim.hands.ContainsKey(pid)) return false;
+        string suit = GetSuit(refCard); int rank = GetRankValue(refCard);
+        return sim.hands[pid].Any(c => GetSuit(c) == suit && GetRankValue(c) < rank);
+    }
+
+    private HashSet<string> BuildDominantSuitsFromSim(SimState sim, string botId, List<string> hand)
+    {
+        var dom = new HashSet<string>();
+        foreach (string s in AllSuits)
+        {
+            int remaining = 13 - _discardPile.Count(c => GetSuit(c) == s);
+            int myCount   = hand.Count(c => GetSuit(c) == s);
+            if (myCount >= remaining - 1) dom.Add(s);
+        }
+        return dom;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  UPGRADE DISCARD CARD WITH OTHER BOTS
+    //
+    //  When a bot is forced to play out-of-suit (Thulla / discard), before
+    //  actually playing the chosen card, check if any other active bot holds
+    //  a HIGHER card of the SAME suit. If yes, swap — this bot plays the
+    //  highest available card of that suit instead, dumping it from the game
+    //  at the best possible value.
+    //
+    //  Why: when you MUST discard anyway, you want to remove the highest
+    //  possible card of that suit — not waste a low card while strong cards
+    //  sit in other bots' hands.
+    //
+    //  Rule: No restriction on A/K/Q here — any higher card can be swapped in.
+    //        The other bot absorbs the weaker card in return.
+    //
+    //  Example:
+    //    Bot1 must discard. Chosen card = 8H.
+    //    Bot2 has 10H. Bot3 has QH.
+    //    Best upgrade = QH (rank 12 > rank 10 > rank 8).
+    //    → Swap: Bot1 gets QH, Bot3 gets 8H.
+    //    → Bot1 plays QH. QH is removed from game on this Thulla.
+    //
+    //  Example 2 (no upgrade available):
+    //    Bot1 chosen card = JH. No other bot has any Heart higher than J.
+    //    → Play JH as-is.
+    // ═══════════════════════════════════════════════════════════════════════
+
+    private string UpgradeDiscardWithOtherBots(GameState gs, string botId, string chosenCard)
+    {
+        if (string.IsNullOrEmpty(chosenCard)) return chosenCard;
+
+        // ── Skip upgrade if the trick was LED by a bot ───────────────────────
+        // When a bot started this trick, swapping out-of-suit cards between
+        // bots is unnecessary — the leading bot is already coordinated.
+        // Only upgrade when a HUMAN led the trick (cardsInPlay[0] is human).
+        if (gs.cardsInPlay != null && gs.cardsInPlay.Count > 0)
+        {
+            string leadPlayer = gs.cardsInPlay[0].playerId;
+            if (leadPlayer != null && leadPlayer.StartsWith("BOT_"))
+            {
+                Debug.Log($"[Discard Upgrade] Skipped — trick was led by bot {leadPlayer}");
+                return chosenCard;
+            }
+        }
+
+        // ── Skip upgrade if the chosen card is already KNOWN ─────────────────
+        // A known card has already been played publicly in a previous round.
+        // No benefit in swapping it — opponents already know it exists.
+        // Play it as-is and preserve unknown cards for future swaps.
+        if (_knownCards.Contains(chosenCard))
+        {
+            Debug.Log($"[Discard Upgrade] Skipped — {chosenCard} is already a known card");
+            return chosenCard;
+        }
+
+        string suit    = GetSuit(chosenCard);
+        int    myRank  = GetRankValue(chosenCard);
+
+        // Find the highest card of the same suit across all other active bots
+        string bestUpgradeCard = null;
+        string bestUpgradePid  = null;
+        int    bestUpgradeRank = myRank; // must strictly beat current card
+
+        foreach (string pid in gs.activePlayers)
+        {
+            if (pid == botId) continue;                        // skip self
+            if (!pid.StartsWith("BOT_")) continue;            // only swap with other bots
+            if (!gs.hands.ContainsKey(pid)) continue;
+
+            foreach (string c in gs.hands[pid])
+            {
+                if (GetSuit(c) != suit) continue;
+                int r = GetRankValue(c);
+                if (r > bestUpgradeRank)
+                {
+                    bestUpgradeRank = r;
+                    bestUpgradeCard = c;
+                    bestUpgradePid  = pid;
+                }
+            }
+        }
+
+        if (bestUpgradeCard == null)
+            return chosenCard; // no upgrade available — play original card
+
+        // Perform the swap directly on the real hands
+        gs.hands[botId].Remove(chosenCard);
+        gs.hands[bestUpgradePid].Remove(bestUpgradeCard);
+        gs.hands[botId].Add(bestUpgradeCard);
+        gs.hands[bestUpgradePid].Add(chosenCard);
+
+        Debug.Log($"[Discard Upgrade] Bot {botId} [{chosenCard}] ↔ Bot {bestUpgradePid} [{bestUpgradeCard}] — playing {bestUpgradeCard}");
+
+        return bestUpgradeCard;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  DISCARD ALGORITHM
+    //  Choose the suit with the fewest cards; break ties by highest total
+    //  value. Play the highest card of the chosen suit.
+    // ═══════════════════════════════════════════════════════════════════════
 
     private string DiscardUsingLowestSuitAlgorithm(List<string> hand, string excludeSuit)
     {
-        var suitsInHand = hand
-            .Where(c => GetSuit(c) != excludeSuit)
+        var byS = hand
+            .Where(c => string.IsNullOrEmpty(excludeSuit) || GetSuit(c) != excludeSuit)
             .GroupBy(GetSuit)
             .ToDictionary(g => g.Key, g => g.ToList());
 
-        if (suitsInHand.Count == 0)
-        {
-            // No choice — play the highest card of anything
-            return HighestCard(hand);
-        }
+        if (byS.Count == 0) return HighestCard(hand);
 
-        int minCount = suitsInHand.Values.Min(l => l.Count);
+        int minCount = byS.Values.Min(l => l.Count);
 
-        do
-        {
-            var candidates = suitsInHand.Where(kv => kv.Value.Count == minCount).ToList();
+        var candidates = byS.Where(kv => kv.Value.Count == minCount).ToList();
+        if (candidates.Count == 1) return HighestCard(candidates[0].Value);
 
-            if (candidates.Count == 1)
-                return HighestCard(candidates[0].Value);
-
-            // Multiple suits at same count: pick highest total value suit
-            int maxVal    = candidates.Max(kv => kv.Value.Sum(GetRankValue));
-            var bestSuits = candidates.Where(kv => kv.Value.Sum(GetRankValue) == maxVal).ToList();
-
-            // Pick any if still tied
-            return HighestCard(bestSuits[0].Value);
-
-            // (loop guard — realistically won't iterate)
-        }
-        while (false);
-
-        return HighestCard(hand);
+        int maxVal    = candidates.Max(kv => kv.Value.Sum(GetRankValue));
+        var bestSuits = candidates.Where(kv => kv.Value.Sum(GetRankValue) == maxVal).ToList();
+        return HighestCard(bestSuits[0].Value);
     }
 
-    // ── HELPERS ──────────────────────────────────────────────────────────────
+    // ═══════════════════════════════════════════════════════════════════════
+    //  SHARED HELPERS
+    // ═══════════════════════════════════════════════════════════════════════
 
     private static readonly string[] AllSuits = { "S", "H", "D", "C" };
 
@@ -285,10 +769,8 @@ public class BotStrategy
         string r = code.Substring(0, code.Length - 1);
         switch (r)
         {
-            case "A": return 14;
-            case "K": return 13;
-            case "Q": return 12;
-            case "J": return 11;
+            case "A": return 14; case "K": return 13;
+            case "Q": return 12; case "J": return 11;
             default:  return int.TryParse(r, out int v) ? v : 0;
         }
     }
@@ -304,51 +786,56 @@ public class BotStrategy
 
     private HashSet<string> EnsureVoids(string pid)
     {
-        if (!_knownVoids.ContainsKey(pid))
-            _knownVoids[pid] = new HashSet<string>();
+        if (!_knownVoids.ContainsKey(pid)) _knownVoids[pid] = new HashSet<string>();
         return _knownVoids[pid];
     }
 
-    // ── Player knowledge helpers (probability-aware) ──────────────────────────
+    private HashSet<string> BuildDominantSuits(List<string> hand)
+    {
+        var dom = new HashSet<string>();
+        foreach (string s in AllSuits)
+        {
+            int remaining = 13 - DiscardedCount(s);
+            int myCount   = hand.Count(c => GetSuit(c) == s);
+            if (myCount >= remaining - 1) dom.Add(s);
+        }
+        return dom;
+    }
 
-    /// <summary>Best estimate of whether a player has any card of the given suit.</summary>
+    // ── GameState-based player knowledge ─────────────────────────────────────
+
     private bool PlayerHasSuit(GameState gs, string pid, string suit)
     {
-        // If we know they're void, definitely not.
-        if (_knownVoids.ContainsKey(pid) && _knownVoids[pid].Contains(suit))
-            return false;
-
-        // If we can inspect their actual hand (bot vs. bot, host-side), use it.
-        if (gs.hands.ContainsKey(pid))
-            return gs.hands[pid].Any(c => GetSuit(c) == suit);
-
-        // Otherwise assume they might have it (safe/conservative)
+        if (_knownVoids.ContainsKey(pid) && _knownVoids[pid].Contains(suit)) return false;
+        if (gs.hands.ContainsKey(pid)) return gs.hands[pid].Any(c => GetSuit(c) == suit);
         return true;
     }
 
     private bool AllActivePlayers_HaveSuit(GameState gs, string selfId, string suit)
-    {
-        foreach (var pid in gs.activePlayers)
-        {
-            if (pid == selfId) continue;
-            if (!PlayerHasSuit(gs, pid, suit)) return false;
-        }
-        return true;
-    }
+        => gs.activePlayers.Where(p => p != selfId).All(p => PlayerHasSuit(gs, p, suit));
 
-    private bool PlayerHasGreaterCard(GameState gs, string pid, string referenceCard)
+    private bool PlayerHasGreaterCard(GameState gs, string pid, string refCard)
     {
-        if (!gs.hands.ContainsKey(pid)) return false; // can't tell → assume no
-        string suit = GetSuit(referenceCard);
-        int rank    = GetRankValue(referenceCard);
+        if (!gs.hands.ContainsKey(pid)) return false;
+        string suit = GetSuit(refCard); int rank = GetRankValue(refCard);
         return gs.hands[pid].Any(c => GetSuit(c) == suit && GetRankValue(c) > rank);
     }
 
-    private bool PlayerHasLowerCard(GameState gs, string pid, string referenceCard)
+    private bool PlayerHasLowerCard(GameState gs, string pid, string refCard)
     {
         if (!gs.hands.ContainsKey(pid)) return false;
-        string suit = GetSuit(referenceCard);
-        int rank    = GetRankValue(referenceCard);
+        string suit = GetSuit(refCard); int rank = GetRankValue(refCard);
         return gs.hands[pid].Any(c => GetSuit(c) == suit && GetRankValue(c) < rank);
+    }
+
+    /// <summary>
+    /// Returns the highest card of <paramref name="suit"/> from a player's hand,
+    /// or empty string if they have none of that suit.
+    /// </summary>
+    private string GetHighestCardOfSuitFromHand(GameState gs, string pid, string suit)
+    {
+        if (!gs.hands.ContainsKey(pid)) return "";
+        var matching = gs.hands[pid].Where(c => GetSuit(c) == suit).ToList();
+        return matching.Count > 0 ? HighestCard(matching) : "";
     }
 }

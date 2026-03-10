@@ -2,11 +2,11 @@ using UnityEngine;
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.Linq;
 using System.Threading.Tasks;
 using Firebase.Firestore;
 using System.Text;
 using System.IO;
-using System.Linq;
 
 public class GameManager : MonoBehaviour
 {
@@ -343,6 +343,10 @@ public class GameManager : MonoBehaviour
 
         if (CheckGameOver()) return; // Added safety
 
+        // Reset turn key so ProcessCurrentTurn does not skip as duplicate
+        // (same bot is still leading after stealing — round/index unchanged).
+        _lastProcessedTurnKey = -1;
+        _isExecutingMove = false;
         _gs.turnStartTime = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         WriteGameStateAndProcess();
         Debug.Log($"[GameManager] Bot {playerId} stole from {leftId}.");
@@ -435,23 +439,171 @@ public class GameManager : MonoBehaviour
         if (_gs.CurrentPlayerId != PlayerDataManager.PlayFabId) return;
         if (!string.IsNullOrEmpty(_gs.leadSuit)) return;
         if (_isExecutingMove) return;
+
         string localId = PlayerDataManager.PlayFabId;
-        string leftId = GetNextActivePlayerLeft(localId);
-        if (string.IsNullOrEmpty(leftId)) return;
-        if (!_gs.hands.ContainsKey(leftId) || _gs.hands[leftId].Count == 0) return;
-        var stolen = new List<string>(_gs.hands[leftId]);
-        _gs.hands[leftId].Clear();
+
+        // ── Find the next active player to steal from (human or bot) ─────────
+        // Always steal from the immediately next active player in seat order,
+        // regardless of whether they are a bot or human.
+        string targetId = GetNextActivePlayerLeft(localId);
+        if (string.IsNullOrEmpty(targetId))
+        {
+            Debug.Log("[Steal] No active player found to steal from.");
+            return;
+        }
+        if (!_gs.hands.ContainsKey(targetId) || _gs.hands[targetId].Count == 0) return;
+
+        // ── Only upgrade the hand when stealing from a bot ────────────────────
+        // UpgradeStealHand swaps weak bot cards with stronger ones from other
+        // bots. This makes no sense when stealing from a human — skip it.
+        if (IsBot(targetId))
+            UpgradeStealHand(targetId);
+
+        // ── Give the (now upgraded) hand to the human ────────────────────────
+        var stolen = new List<string>(_gs.hands[targetId]);
+        _gs.hands[targetId].Clear();
         _gs.hands[localId].AddRange(stolen);
         _myHand = new List<string>(_gs.hands[localId]);
         EventManager.FireLocalHandUpdated(new List<string>(_myHand), _gs);
-        if (!_gs.winners.Contains(leftId)) _gs.winners.Add(leftId);
-        _gs.activePlayers.Remove(leftId);
+        if (!_gs.winners.Contains(targetId)) _gs.winners.Add(targetId);
+        _gs.activePlayers.Remove(targetId);
         AdjustCurrentIndexAfterRemoval();
 
-        if (CheckGameOver()) return; // Added safety
+        if (CheckGameOver()) return;
 
+        // Reset turn key so ProcessCurrentTurn does not treat this as a
+        // duplicate turn — same player is still leading after the steal.
+        _lastProcessedTurnKey = -1;
+        _isExecutingMove = false;
         _gs.turnStartTime = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
         WriteGameStateAndProcess();
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    //  UPGRADE STEAL HAND
+    //
+    //  Before the stolen bot hand is given to the human, compare every card in
+    //  it against the same-suit cards held by ALL OTHER active bots.
+    //  For each suit in the stolen hand:
+    //    1. Collect all cards of that suit from other bots that are HIGHER than
+    //       the stolen hand card.
+    //    2. Swap the stolen hand's lower card with the other bot's higher card.
+    //       → Stolen hand gets stronger; donor bot absorbs the weaker card.
+    //    3. 2s and 3s: only kept in the stolen hand if NO other bot has ANY
+    //       card of that suit (nothing to swap with).
+    //
+    //  A and K are ALLOWED in the stolen hand (no restriction here).
+    //  Only 2 and 3 are pushed out if possible.
+    //
+    //  Example:
+    //    Stolen hand (Bot1): 6H  4H  QS  7D  3C
+    //    Bot2 has:           JH  KH  9S  5D  8C
+    //    Bot3 has:           AH  10D  6C
+    //
+    //    Hearts:   6H < JH → swap 6H↔JH. 4H < KH → swap 4H↔KH.
+    //              Stolen now has JH KH. Bot2 absorbs 6H 4H.
+    //    Spades:   QS > 9S → no higher bot card. Keep QS.
+    //    Diamonds: 7D < 10D → swap 7D↔10D. Stolen now has 10D. Bot3 absorbs 7D.
+    //    Clubs:    3C is a 3. Bot2 has 8C (same suit) → swap 3C↔8C. Keep 8C.
+    //              (If no bot had any club, 3C would stay in stolen hand.)
+    //
+    //  Final stolen hand given to human: JH KH QS 10D 8C
+    // ══════════════════════════════════════════════════════════════════════════
+
+    private void UpgradeStealHand(string stealTargetId)
+    {
+        if (!_gs.hands.ContainsKey(stealTargetId)) return;
+
+        List<string> stealHand = _gs.hands[stealTargetId];
+
+        // Collect all other active bots (exclude the steal target and any humans)
+        List<string> otherBots = _gs.activePlayers
+            .Where(pid => pid != stealTargetId && IsBot(pid) && _gs.hands.ContainsKey(pid))
+            .ToList();
+
+        if (otherBots.Count == 0)
+        {
+            Debug.Log("[Steal] No other bots to upgrade steal hand from.");
+            return;
+        }
+
+        // Work suit by suit on a snapshot of current steal hand cards
+        foreach (string suit in new[] { "S", "H", "D", "C" })
+        {
+            // Cards of this suit currently in the steal hand, sorted lowest→highest
+            // (process weakest first so we give the human the best possible upgrade)
+            List<string> stealSuitCards = stealHand
+                .Where(c => GetSuit(c) == suit)
+                .OrderBy(c => GetRankValue(c))
+                .ToList();
+
+            if (stealSuitCards.Count == 0) continue;
+
+            foreach (string stealCard in stealSuitCards)
+            {
+                int stealRank = GetRankValue(stealCard);
+                bool isLowBanned = stealRank == 2 || stealRank == 3;
+
+                // ── Skip if this card is already known ────────────────────────
+                // A known card has been played publicly already — no point
+                // swapping it out, the human already knows it exists.
+                if (_botStrategy.IsKnownCard(stealCard))
+                {
+                    Debug.Log($"[Steal Upgrade] Skipping known card {stealCard}");
+                    continue;
+                }
+
+                // Find the best donor: another bot with the highest card of this
+                // suit that is strictly greater than the steal card.
+                // For 2s/3s: any higher card of this suit qualifies.
+                // For normal cards: find the highest available upgrade.
+                string bestDonorBot  = null;
+                string bestDonorCard = null;
+                int    bestDonorRank = stealRank; // must beat current card
+
+                foreach (string botId in otherBots)
+                {
+                    List<string> botHand = _gs.hands[botId];
+                    // Find highest card of this suit from this bot that beats stealCard
+                    string candidate = botHand
+                        .Where(c => GetSuit(c) == suit && GetRankValue(c) > bestDonorRank)
+                        .OrderByDescending(c => GetRankValue(c))
+                        .FirstOrDefault();
+
+                    if (candidate != null)
+                    {
+                        bestDonorBot  = botId;
+                        bestDonorCard = candidate;
+                        bestDonorRank = GetRankValue(candidate);
+                    }
+                }
+
+                if (bestDonorCard != null)
+                {
+                    // Perform swap: steal hand gets stronger card, donor bot gets weaker card
+                    stealHand.Remove(stealCard);
+                    _gs.hands[bestDonorBot].Remove(bestDonorCard);
+                    stealHand.Add(bestDonorCard);
+                    _gs.hands[bestDonorBot].Add(stealCard);
+
+                    Debug.Log($"[Steal Upgrade] {stealTargetId} [{stealCard}] ↔ bot {bestDonorBot} [{bestDonorCard}]");
+                }
+                else if (isLowBanned)
+                {
+                    // 2 or 3 and no bot has a higher card of this suit.
+                    // Check if any bot has ANY card of this suit at all —
+                    // if they do, we could at least swap equal-or-lower (keep as-is),
+                    // but since nothing is higher, the 2/3 stays in steal hand.
+                    bool anyBotHasSuit = otherBots.Any(b =>
+                        _gs.hands[b].Any(c => GetSuit(c) == suit));
+
+                    if (!anyBotHasSuit)
+                        Debug.Log($"[Steal Upgrade] No bot has {suit} — keeping {stealCard} in steal hand.");
+                    else
+                        Debug.Log($"[Steal Upgrade] No higher {suit} card available — keeping {stealCard}.");
+                }
+            }
+        }
     }
 
     private void ExecuteMove(string playerId, string cardCode)
@@ -543,6 +695,7 @@ public class GameManager : MonoBehaviour
         }
 
         FlushRoundLog(isThulla: false, pickupId: winnerId);
+        _botStrategy.RecordDiscard(_gs.cardsInPlay.Select(pc => pc.card).ToList());
         _subRoundIndex = 0;
         var playedSnapshot = new List<PlayedCard>(_gs.cardsInPlay);
         _gs.cardsInPlay.Clear();
@@ -762,15 +915,18 @@ public class GameManager : MonoBehaviour
         for (int seatIdx = 0; seatIdx < seatCount; seatIdx++)
         {
             SlotData humanSlot = _seatedPlayers[seatIdx];
-            if (humanSlot.isBot) continue; // skip bots
+            if (humanSlot.isBot) continue;                          // skip bots
             if (!_gs.hands.ContainsKey(humanSlot.id)) continue;
 
             List<string> humanHand = _gs.hands[humanSlot.id];
 
-            // Collect all 2s and 3s this human holds (work on a snapshot so
-            // we can safely modify the list while iterating)
+            // Collect all cards the human must never hold: 2, 3, Ace (14), King (13).
+            // Work on a snapshot so we can safely modify the list while iterating.
             List<string> lowCards = humanHand
-                .FindAll(c => GetRankValue(c) == 2 || GetRankValue(c) == 3);
+                .FindAll(c => GetRankValue(c) == 2
+                           || GetRankValue(c) == 3
+                           || GetRankValue(c) == 13   // King
+                           || GetRankValue(c) == 14); // Ace
 
             if (lowCards.Count == 0) continue;
 
@@ -820,6 +976,10 @@ public class GameManager : MonoBehaviour
         // same suit (one-for-one, highest bot card paired with lowest human card).
         // This is done suit-by-suit so the swap is always same-suit for same-suit.
 
+        // ── Count humans vs bots for Pass 3 restriction logic ───────────────
+        int humanCount = _seatedPlayers.Count(s => !s.isBot);
+        int botCount   = _seatedPlayers.Count(s =>  s.isBot);
+
         Debug.Log("[Balance] ── Pass 2: upgrade lower suit cards via next bot ──");
 
         for (int seatIdx = 0; seatIdx < seatCount; seatIdx++)
@@ -833,14 +993,14 @@ public class GameManager : MonoBehaviour
             if (string.IsNullOrEmpty(nextBotId)) continue;
 
             List<string> humanHand = _gs.hands[humanSlot.id];
-            List<string> botHand = _gs.hands[nextBotId];
+            List<string> botHand   = _gs.hands[nextBotId];
 
             // Work suit-by-suit
             foreach (string suit in new[] { "S", "H", "D", "C" })
             {
                 // Bot's highest card of this suit
                 string botHighest = GetHighestCardOfSuit(botHand, suit);
-                if (string.IsNullOrEmpty(botHighest)) continue; // bot has none of this suit
+                if (string.IsNullOrEmpty(botHighest)) continue;    // bot has none of this suit
                 int botHighRank = GetRankValue(botHighest);
 
                 // All human cards of this suit that are strictly lower than bot's highest
@@ -850,12 +1010,26 @@ public class GameManager : MonoBehaviour
                 if (humanLower.Count == 0) continue;
 
                 // Collect all bot cards of this suit that are strictly higher
-                // than each human card we want to replace, sorted highest→lowest
-                // so we pair the best bot card with the worst human card first.
+                // than each human card we want to replace AND are not Ace/King
+                // (rank < 13), sorted highest→lowest (best safe card first).
+                // Only fall back to Ace/King if absolutely no other card exists.
+                // Donor cards must not be 2, 3, King(13), or Ace(14) — humans must never hold those.
                 List<string> botHigherCards = botHand
-                    .FindAll(c => GetSuit(c) == suit && GetRankValue(c) > GetRankValue(humanLower[0]))
+                    .FindAll(c => GetSuit(c) == suit
+                               && GetRankValue(c) > GetRankValue(humanLower[0])
+                               && GetRankValue(c) > 3     // exclude 2 and 3
+                               && GetRankValue(c) < 13)   // exclude King(13) and Ace(14)
                     .OrderByDescending(c => GetRankValue(c))
                     .ToList();
+
+                // Fallback: if no safe card exists, allow any higher card (edge case — bot hand limited)
+                if (botHigherCards.Count == 0)
+                {
+                    botHigherCards = botHand
+                        .FindAll(c => GetSuit(c) == suit && GetRankValue(c) > GetRankValue(humanLower[0]))
+                        .OrderByDescending(c => GetRankValue(c))
+                        .ToList();
+                }
 
                 // Re-sort human lower cards worst→best so we swap the weakest first
                 humanLower.Sort((a, b) => GetRankValue(a).CompareTo(GetRankValue(b)));
@@ -864,7 +1038,7 @@ public class GameManager : MonoBehaviour
                 for (int i = 0; i < swapCount; i++)
                 {
                     string humanCard = humanLower[i];
-                    string botCard = botHigherCards[i];
+                    string botCard   = botHigherCards[i];
 
                     // Safety: skip if bot card is not actually higher than human card
                     if (GetRankValue(botCard) <= GetRankValue(humanCard)) continue;
@@ -875,6 +1049,116 @@ public class GameManager : MonoBehaviour
                     botHand.Add(humanCard);
 
                     Debug.Log($"[Balance P2] {humanSlot.id} [{humanCard}] ↔ bot {nextBotId} [{botCard}]");
+                }
+            }
+        }
+
+        // ══════════════════════════════════════════════════════════════════
+        //  PASS 3 : Ensure each human has at least 2 cards of every suit
+        //
+        //  After Passes 1 and 2, some humans may still hold fewer than 2
+        //  cards of a particular suit (e.g. only 1 Spade, or 0 Diamonds).
+        //  This pass tops them up to 2 by pulling cards from any available
+        //  bot hand.
+        //
+        //  Allowed donor cards depend on table composition:
+        //    2 humans + 2 bots  →  A and K allowed in human hand, but NOT 2 or 3
+        //    3 humans + 1 bot   →  A and K allowed in human hand, but NOT 2 or 3
+        //    default (1 human)  →  A, K, 2, 3 all banned from human hand
+        //
+        //  Donor search: scan ALL bots, pick the highest available card of
+        //  the needed suit within the allowed rank range. Any bot can donate.
+        //
+        //  Example (2 humans + 2 bots):
+        //    Human has: AS KH 7D 9C 5C
+        //    Suit counts: S=1 H=1 D=1 C=2
+        //    Need 1 more Spade → bots scanned → best is QS (rank 12, allowed) → swap
+        //    Need 1 more Heart → bots scanned → best is JH (rank 11, allowed) → swap
+        //    Need 1 more Diamond → bots scanned → best is 10D → swap
+        //    Clubs already ≥ 2 → skip
+        // ══════════════════════════════════════════════════════════════════
+
+        Debug.Log("[Balance] ── Pass 3: ensure each human has ≥2 cards per suit ──");
+
+        // Determine if A and K are allowed in human hands for this session
+        // (true when 2+ humans at table; false in default 1-human config)
+        bool akAllowedInHumanHand = humanCount >= 2;
+
+        for (int seatIdx = 0; seatIdx < seatCount; seatIdx++)
+        {
+            SlotData humanSlot = _seatedPlayers[seatIdx];
+            if (humanSlot.isBot) continue;
+            if (!_gs.hands.ContainsKey(humanSlot.id)) continue;
+
+            List<string> humanHand = _gs.hands[humanSlot.id];
+
+            foreach (string suit in new[] { "S", "H", "D", "C" })
+            {
+                int suitCount = humanHand.Count(c => GetSuit(c) == suit);
+                if (suitCount >= 2) continue;   // already has 2+ of this suit
+
+                int needed = 2 - suitCount;
+
+                for (int n = 0; n < needed; n++)
+                {
+                    // Find the best donor card from any bot
+                    // Best = highest rank of this suit within allowed range
+                    string bestCard   = null;
+                    string bestBotId  = null;
+                    int    bestRank   = -1;
+
+                    foreach (SlotData slot in _seatedPlayers)
+                    {
+                        if (!slot.isBot) continue;
+                        if (!_gs.hands.ContainsKey(slot.id)) continue;
+
+                        foreach (string c in _gs.hands[slot.id])
+                        {
+                            if (GetSuit(c) != suit) continue;
+                            int rk = GetRankValue(c);
+
+                            // Never give 2 or 3 to human under any circumstance
+                            if (rk == 2 || rk == 3) continue;
+
+                            // A (14) and K (13) only allowed when akAllowedInHumanHand
+                            if (!akAllowedInHumanHand && (rk == 13 || rk == 14)) continue;
+
+                            if (rk > bestRank)
+                            {
+                                bestRank  = rk;
+                                bestCard  = c;
+                                bestBotId = slot.id;
+                            }
+                        }
+                    }
+
+                    if (bestCard == null)
+                    {
+                        Debug.Log($"[Balance P3] No valid donor card of {suit} for human {humanSlot.id} — skipping.");
+                        break;
+                    }
+
+                    // Find a card from human hand to swap back to bot
+                    // Prefer: lowest card of any other suit (keep the suit we just got)
+                    // Fallback: lowest card overall
+                    string swapBack = humanHand
+                        .Where(c => GetSuit(c) != suit)
+                        .OrderBy(c => GetRankValue(c))
+                        .FirstOrDefault()
+                        ?? humanHand.OrderBy(c => GetRankValue(c)).FirstOrDefault();
+
+                    if (swapBack == null)
+                    {
+                        Debug.Log($"[Balance P3] Human {humanSlot.id} has no card to swap back — skipping.");
+                        break;
+                    }
+
+                    humanHand.Remove(swapBack);
+                    _gs.hands[bestBotId].Remove(bestCard);
+                    humanHand.Add(bestCard);
+                    _gs.hands[bestBotId].Add(swapBack);
+
+                    Debug.Log($"[Balance P3] Human {humanSlot.id} [{swapBack}] ↔ bot {bestBotId} [{bestCard}] (needed {suit} ×{needed})");
                 }
             }
         }
@@ -895,7 +1179,6 @@ public class GameManager : MonoBehaviour
             if (slot.isBot && _gs.hands.ContainsKey(slot.id) && _gs.hands[slot.id].Count > 0)
                 return slot.id;
         }
-
         return "";
     }
 
@@ -914,45 +1197,54 @@ public class GameManager : MonoBehaviour
             if (slot.isBot && _gs.hands.ContainsKey(slot.id) && _gs.hands[slot.id].Count > 0)
                 return slot.id;
         }
-
         return "";
     }
 
-    /// <summary>Returns the highest-ranked card of <paramref name="suit"/> from the list, or "" if none.</summary>
+    /// <summary>
+    /// Returns the highest-ranked card of <paramref name="suit"/> from the list
+    /// that is NOT an Ace or King (rank >= 13). Those are too valuable to donate to humans.
+    /// Falls back to the true highest only if every card of that suit is an Ace/King.
+    /// Returns "" if the hand has no card of that suit at all.
+    /// </summary>
     private string GetHighestCardOfSuit(List<string> hand, string suit)
     {
-        string best = "";
-        int bestRk = -1;
+        string bestSafe = "";
+        string bestAny  = "";
+        int    bestSafeRk = -1;
+        int    bestAnyRk  = -1;
         foreach (var c in hand)
         {
             if (GetSuit(c) != suit) continue;
             int rk = GetRankValue(c);
-            if (rk > bestRk)
-            {
-                bestRk = rk;
-                best = c;
-            }
+            if (rk > bestAnyRk) { bestAnyRk = rk; bestAny = c; }
+            // Skip 2, 3, King(13), Ace(14) — humans must never receive these
+            if (rk <= 3 || rk >= 13) continue;
+            if (rk > bestSafeRk) { bestSafeRk = rk; bestSafe = c; }
         }
-
-        return best;
+        return !string.IsNullOrEmpty(bestSafe) ? bestSafe : bestAny;
     }
 
-    /// <summary>Returns the highest-ranked card from any suit in the list, or "" if empty.</summary>
+    /// <summary>
+    /// Returns the highest-ranked card from any suit in the list
+    /// that is NOT an Ace or King (rank >= 13).
+    /// Falls back to the true highest only if all cards are Aces/Kings.
+    /// Returns "" if the hand is empty.
+    /// </summary>
     private string GetHighestCardOfAny(List<string> hand)
     {
-        string best = "";
-        int bestRk = -1;
+        string bestSafe = "";
+        string bestAny  = "";
+        int    bestSafeRk = -1;
+        int    bestAnyRk  = -1;
         foreach (var c in hand)
         {
             int rk = GetRankValue(c);
-            if (rk > bestRk)
-            {
-                bestRk = rk;
-                best = c;
-            }
+            if (rk > bestAnyRk) { bestAnyRk = rk; bestAny = c; }
+            // Skip 2, 3, King(13), Ace(14) — humans must never receive these
+            if (rk <= 3 || rk >= 13) continue;
+            if (rk > bestSafeRk) { bestSafeRk = rk; bestSafe = c; }
         }
-
-        return best;
+        return !string.IsNullOrEmpty(bestSafe) ? bestSafe : bestAny;
     }
 
     private string LabelOf(string pid)

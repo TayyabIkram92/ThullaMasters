@@ -75,6 +75,7 @@ public class InGameView : MonoBehaviour
 
     private void OnEnable()
     {
+        ResetView();
         EventManager.OnGameReady += HandleGameReady;
         EventManager.OnGameStateUpdated += HandleGameStateUpdated;
         EventManager.OnLocalHandUpdated += HandleLocalHandUpdated;
@@ -86,6 +87,7 @@ public class InGameView : MonoBehaviour
         EventManager.OnGameStateUpdated -= HandleGameStateUpdated;
         EventManager.OnLocalHandUpdated -= HandleLocalHandUpdated;
         StopTimer();
+        ResetView();
     }
 
     private void OnDestroy()
@@ -107,6 +109,55 @@ public class InGameView : MonoBehaviour
         HideAllPlayedCards();
         HideAllTimers();
         HideFlippedCards();
+    }
+
+    /// <summary>
+    /// Clears all visual state: destroys spawned cards, empties profile names,
+    /// hides result labels and steal buttons.
+    /// Called on OnEnable (before a game starts) and OnDisable (cleanup).
+    /// Safe to call at any time — HandleGameReady repopulates everything fresh
+    /// immediately after OnEnable, so there is no visual flicker or logic gap.
+    /// </summary>
+    private void ResetView()
+    {
+        // Destroy all local player card GameObjects
+        foreach (var go in _spawnedCards)
+            if (go != null) Destroy(go);
+        _spawnedCards.Clear();
+
+        // Destroy all flipped (shootout) cards
+        HideFlippedCards();
+
+        // Destroy all debug hand cards
+        for (int slot = 0; slot < _debugCards.Length; slot++)
+        {
+            foreach (var go in _debugCards[slot])
+                if (go != null) Destroy(go);
+            _debugCards[slot].Clear();
+        }
+
+        // Reset every profile slot to empty visual state
+        foreach (var p in profiles)
+        {
+            if (p == null) continue;
+            if (p.nameText            != null) p.nameText.text = "";
+            if (p.remainingCardsText  != null) p.remainingCardsText.text = "";
+            if (p.avatarImage         != null) p.avatarImage.sprite = null;
+            if (p.playedCardImage     != null) p.playedCardImage.gameObject.SetActive(false);
+            if (p.timerImage          != null) p.timerImage.gameObject.SetActive(false);
+            if (p.stealButton         != null) p.stealButton.gameObject.SetActive(false);
+            if (p.resultText          != null)
+            {
+                p.resultText.text = "";
+                p.resultText.gameObject.SetActive(false);
+            }
+        }
+
+        // Clear runtime state
+        _seatedPlayers.Clear();
+        _gs    = null;
+        _autoSort = false;
+        StopTimer();
     }
 
     private void PopulateProfiles(List<SlotData> seatedPlayers)
