@@ -14,6 +14,10 @@ namespace UI
         DeleteFriend,
         Matchmaking,
         OnlineFriends,
-        InGame
+        InGame,
+        Tutorial,
+        Settings,
+        Sell,
+        Buy
     }
 }

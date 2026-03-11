@@ -1,13 +1,21 @@
+using System.Collections;
 using UnityEngine;
 using UI;
 
 public class LoadingView : MonoBehaviour
 {
+    [SerializeField] private float loadingTime = 3f;
     private bool _hasRequested = false;
     private bool _isWaitingForData = false;
 
     private void OnEnable()
     {
+        StartCoroutine(StartGame());
+    }
+
+    IEnumerator StartGame()
+    {
+        yield return new WaitForSeconds(loadingTime);
         EventManager.OnAutoLoginChecked += HandleAutoLoginChecked;
 
         if (!_hasRequested)

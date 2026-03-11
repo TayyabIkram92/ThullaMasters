@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "443134828303",
+    "project_id": "thullagame",
+    "storage_bucket": "thullagame.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:443134828303:android:847c0e4b2ab0bf202da87a",
+        "android_client_info": {
+          "package_name": "com.thullamasters.gameuniverse"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBrrnSDdFYMaayvzAqa-adhNodS78IbyUI"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

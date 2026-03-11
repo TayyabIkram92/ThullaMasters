@@ -2,6 +2,7 @@ using UnityEngine;
 using UnityEngine.UI;
 using UI;
 using System.Collections.Generic;
+using DG.Tweening;
 
 public class FriendsView : MonoBehaviour
 {
@@ -65,6 +66,10 @@ public class FriendsView : MonoBehaviour
         if (noFriendsText != null)
             noFriendsText.SetActive(false);
 
+        float baseDelay = 0.5f;
+        float delayIncrement = 0.25f;
+        int index = 0;
+
         foreach (var friendData in FriendsManager.Friends)
         {
             GameObject cardObj = Instantiate(friendCardPrefab, friendCardContainer);
@@ -73,7 +78,21 @@ public class FriendsView : MonoBehaviour
             if (card != null)
                 card.Initialize(friendData);
 
+            // Start scale at 0
+            cardObj.transform.localScale = Vector3.zero;
+
+            // Calculate delay
+            float delay = baseDelay + (index * delayIncrement);
+
+            // Animate
+            cardObj.transform
+                .DOScale(1f, 0.5f)
+                .SetEase(Ease.OutBack)
+                .SetDelay(delay);
+
             _instantiatedCards.Add(cardObj);
+
+            index++;
         }
     }
 

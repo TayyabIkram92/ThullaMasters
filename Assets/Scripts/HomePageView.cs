@@ -32,7 +32,7 @@ public class HomePageView : MonoBehaviour
     [SerializeField] private Button settingsButton;
 
     [Header("Avatar Sprites (0-15)")] [SerializeField]
-    private Sprite[] avatarSprites = new Sprite[16];
+    private Sprite[] avatarSprites = new Sprite[16]; 
 
     // ── Unity ─────────────────────────────────────────────────────────────────
 
@@ -41,21 +41,51 @@ public class HomePageView : MonoBehaviour
         if (profileButton != null)
             profileButton.onClick.AddListener(OnProfileClicked);
         if (plusButton != null)
-            plusButton.onClick.AddListener(() => Debug.Log("[HomePageView] Plus button clicked."));
+            plusButton.onClick.AddListener(PlusButtonClicked);
         if (buyButton != null)
-            buyButton.onClick.AddListener(() => Debug.Log("[HomePageView] Buy button clicked."));
+            buyButton.onClick.AddListener(BuyButtonClicked);
         if (sellButton != null)
-            sellButton.onClick.AddListener(() => Debug.Log("[HomePageView] Sell button clicked."));
+            sellButton.onClick.AddListener(SellButtonClicked);
         if (classicModeButton != null)
             classicModeButton.onClick.AddListener(OnClassicModeClicked);
         if (playWithFriendsButton != null)
-            playWithFriendsButton.onClick.AddListener(() => Debug.Log("[HomePageView] Play With Friends clicked."));
+            playWithFriendsButton.onClick.AddListener(PlayWithFriendsButtonClicked);
         if (tutorialButton != null)
-            tutorialButton.onClick.AddListener(() => Debug.Log("[HomePageView] Tutorial clicked."));
+            tutorialButton.onClick.AddListener(TutorialButtonClicked);
         if (friendsButton != null)
             friendsButton.onClick.AddListener(OnFriendsClicked);
         if (settingsButton != null)
-            settingsButton.onClick.AddListener(() => Debug.Log("[HomePageView] Settings clicked."));
+            settingsButton.onClick.AddListener(SettingsbuttonClicked);
+    }
+
+    private void PlayWithFriendsButtonClicked()
+    {
+        
+    }
+
+    private void SellButtonClicked()
+    {
+        EventManager.FireShowView(ViewType.Sell,true);
+    }
+
+    private void BuyButtonClicked()
+    {
+        EventManager.FireShowView(ViewType.Buy,true);
+    }
+
+    private void PlusButtonClicked()
+    {
+        EventManager.FireShowView(ViewType.Buy,true);
+    }
+
+    private void SettingsbuttonClicked()
+    {
+        EventManager.FireShowView(ViewType.Settings, showAsDialogue: true);
+    }
+
+    private void TutorialButtonClicked()
+    {
+        EventManager.FireShowView(ViewType.Tutorial, true);
     }
 
     private void OnEnable()

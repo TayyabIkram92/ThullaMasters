@@ -2,6 +2,7 @@ using UnityEngine;
 using UnityEngine.UI;
 using UI;
 using System.Collections.Generic;
+using DG.Tweening;
 
 /// <summary>
 /// Displays all available game mode cards.
@@ -62,16 +63,34 @@ public class GameSelectionView : MonoBehaviour
 
         EventManager.OnGameModesFetched -= SpawnGameModeCards;
 
+        int index = 0;
+        float delayIncrement = 0.25f;
+
         foreach (var modeData in GameModeManager.AvailableModes)
         {
             GameObject cardObj = Instantiate(cardPrefab, cardContainer);
-            GameModeCard card  = cardObj.GetComponent<GameModeCard>();
+
+            GameModeCard card = cardObj.GetComponent<GameModeCard>();
             if (card != null)
                 card.Initialize(modeData);
             else
                 Debug.LogError("[GameSelectionView] CardPrefab missing GameModeCard component!");
 
+            // Start from scale 0
+            cardObj.transform.localScale = Vector3.zero;
+
+            // Calculate delay
+            float delay = index * delayIncrement;
+
+            // DOTween animation
+            cardObj.transform
+                .DOScale(1f, 0.5f)
+                .SetEase(Ease.OutBack)
+                .SetDelay(delay);
+
             _instantiatedCards.Add(cardObj);
+
+            index++;
         }
 
         Debug.Log($"[GameSelectionView] Spawned {_instantiatedCards.Count} game mode cards.");

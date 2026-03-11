@@ -2,6 +2,7 @@ using UnityEngine;
 using UnityEngine.UI;
 using System.Collections;
 using System.Collections.Generic;
+using DG.Tweening;
 
 public class InGameView : MonoBehaviour
 {
@@ -435,17 +436,22 @@ public class InGameView : MonoBehaviour
         foreach (var go in _spawnedCards)
             if (go != null)
                 Destroy(go);
+
         _spawnedCards.Clear();
+
         if (cardPrefab == null || cardContainer == null)
         {
             Debug.LogError("[InGameView] cardPrefab/cardContainer null.");
             return;
         }
 
+        int index = 0;
+
         foreach (var card in hand)
         {
             GameObject go = Instantiate(cardPrefab, cardContainer);
             go.name = card.ShortCode;
+
             var img = go.GetComponent<Image>();
             if (img != null)
             {
@@ -461,7 +467,19 @@ public class InGameView : MonoBehaviour
                 btn.interactable = false;
             }
 
+            // DOTween animation
+            go.transform.localScale = Vector3.zero;
+
+            float delay = 2f + (index * 0.25f);
+
+            go.transform
+                .DOScale(1f, 0.5f)
+                .SetEase(Ease.OutBack)
+                .SetDelay(delay);
+
             _spawnedCards.Add(go);
+
+            index++;
         }
 
         if (_autoSort) SortCards();
@@ -598,6 +616,8 @@ public class InGameView : MonoBehaviour
 
             // Spawn cards in sorted order with explicit sibling index
             int siblingIdx = 0;
+            int index = 0;
+
             foreach (var (code, _) in sortable)
             {
                 var card = CardData.FromShortCode(code);
@@ -622,7 +642,19 @@ public class InGameView : MonoBehaviour
                     btn.onClick.RemoveAllListeners();
                 }
 
+                // DOTween animation
+                go.transform.localScale = Vector3.zero;
+
+                float delay = 2f + (index * 0.25f);
+
+                go.transform
+                    .DOScale(1f, 0.5f)
+                    .SetEase(Ease.OutBack)
+                    .SetDelay(delay);
+
                 _debugCards[seatIndex].Add(go);
+
+                index++;
             }
         }
     }

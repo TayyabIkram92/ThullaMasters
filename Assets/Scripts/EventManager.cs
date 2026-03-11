@@ -155,4 +155,17 @@ public static partial class EventManager
 
     public static void FireFriendRemoved()
         => OnFriendRemoved?.Invoke();
+
+    // ── Sounds Manager Events ────────────────────────────────────────────────────────
+
+    /// <summary>Request to turn music or sound On/Off.</summary>
+    public static event Action<bool> OnTurnMusicOnOrOff;
+
+    public static void FireTurnMusicOnOrOff(bool on)
+        => OnTurnMusicOnOrOff?.Invoke(on);
+
+    public static event Action<bool> OnTurnSoundOnOrOff;
+
+    public static void FireTurnSoundOnOrOff(bool on)
+        => OnTurnSoundOnOrOff?.Invoke(on);
 }

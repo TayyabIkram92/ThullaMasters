@@ -170,22 +170,22 @@ public class ProfileView : MonoBehaviour
 
         if (string.IsNullOrEmpty(chosenName))
         {
-            EventManager.FireShowPopUp("Please enter a username.");
             EventManager.FireShowView(ViewType.UserPopUp, showAsDialogue: true);
+            EventManager.FireShowPopUp("Please enter a username.");
             return;
         }
 
         if (chosenName.Length < 3)
         {
-            EventManager.FireShowPopUp("Username must be at least 3 characters.");
             EventManager.FireShowView(ViewType.UserPopUp, showAsDialogue: true);
+            EventManager.FireShowPopUp("Username must be at least 3 characters.");
             return;
         }
 
         if (!_isFirstTime && PlayerDataManager.Coins < 10)
         {
-            EventManager.FireShowPopUp("You need 10 coins to update your profile.");
             EventManager.FireShowView(ViewType.UserPopUp, showAsDialogue: true);
+            EventManager.FireShowPopUp("You need 10 coins to update your profile.");
             return;
         }
 
@@ -201,8 +201,8 @@ public class ProfileView : MonoBehaviour
 
             if (!isAvailable)
             {
-                EventManager.FireShowPopUp($"Username '{chosenName}' is already taken.\nPlease try another one.");
                 EventManager.FireShowView(ViewType.UserPopUp, showAsDialogue: true);
+                EventManager.FireShowPopUp($"Username '{chosenName}' is already taken.\nPlease try another one.");
                 return;
             }
 
