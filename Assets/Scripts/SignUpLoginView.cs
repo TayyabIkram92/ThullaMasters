@@ -1,7 +1,6 @@
 using TMPro;
 using UnityEngine;
 using UnityEngine.UI;
-using UI;
 
 public class SignUpLoginView : MonoBehaviour
 {
@@ -25,6 +24,7 @@ public class SignUpLoginView : MonoBehaviour
 
     private void OnEnable()
     {
+        ResetView();
         EventManager.OnAuthSuccess += HandleAuthSuccess;
         EventManager.OnAuthConflict += HandleAuthConflict;
         EventManager.OnPlayerDataLoaded += HandlePlayerDataLoaded;
@@ -44,8 +44,13 @@ public class SignUpLoginView : MonoBehaviour
         loginAsGuestButton.onClick.RemoveListener(OnLoginAsGuestClicked);
     }
 
-    // ── Button Callbacks ──────────────────────────────────────────────────────
+    private void ResetView()
+    {
+        emailInputField.text = "";
+        passwordInputField.text = "";
+    }
 
+    // ── Button Callbacks ──────────────────────────────────────────────────────
     private void OnLoginClicked()
     {
         if (!ValidateInputs()) return;
@@ -59,6 +64,7 @@ public class SignUpLoginView : MonoBehaviour
     {
         if (!ValidateInputs()) return;
         SetButtonsInteractable(false);
+        // 2-param version: (email, password)
         EventManager.FireRegisterAndLoginRequested(
             emailInputField.text.Trim(),
             passwordInputField.text);
@@ -74,9 +80,10 @@ public class SignUpLoginView : MonoBehaviour
     private void HandleAuthSuccess()
     {
         SetButtonsInteractable(true);
-        // EventManager.FireShowView(ViewType.Home);
     }
 
+    // Matches Action<bool> — bool = triedLogin (true = tried to login but not registered,
+    // false = tried to register but already registered)
     private void HandleAuthConflict(bool triedLogin)
     {
         SetButtonsInteractable(true);
@@ -87,6 +94,11 @@ public class SignUpLoginView : MonoBehaviour
 
         EventManager.FireShowView(ViewType.UserPopUp, showAsDialogue: true);
         EventManager.FireShowPopUp(message);
+    }
+
+    private void HandlePlayerDataLoaded()
+    {
+        EventManager.FireShowView(ViewType.Home);
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -108,10 +120,5 @@ public class SignUpLoginView : MonoBehaviour
         loginButton.interactable = state;
         registerAndLoginButton.interactable = state;
         loginAsGuestButton.interactable = state;
-    }
-
-    private void HandlePlayerDataLoaded() // ← NEW
-    {
-        EventManager.FireShowView(ViewType.Home);
     }
 }

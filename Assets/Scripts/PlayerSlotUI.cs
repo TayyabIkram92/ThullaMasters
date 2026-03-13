@@ -1,115 +1,78 @@
+using DG.Tweening;
 using UnityEngine;
 using UnityEngine.UI;
+using TMPro;
 
-/// <summary>
-/// Controls a single player slot in the Matchmaking screen.
-///
-/// Three slot types share this one script, configured via Inspector:
-///
-/// ── Slot 1: UserProfile (local player) ───────────────────────────────────────
-///   Wire: avatarGO, avatarImage, playerNameTxt
-///   isFriendSlot = false
-///   Call SetLocalPlayer() once on enable — never SetEmpty().
-///
-/// ── Slot 2: Friend/RandomProfile (friend invite slot) ────────────────────────
-///   Wire: avatarGO, avatarImage, playerNameTxt, addIconGO, popupAddFriendGO
-///   isFriendSlot = true
-///   Empty state  → avatarGO hidden, addIconGO + popupAddFriendGO visible.
-///   Filled state → avatarGO visible, addIconGO + popupAddFriendGO hidden.
-///
-/// ── Slots 3 & 4: RandomProfile ───────────────────────────────────────────────
-///   Wire: avatarGO, avatarImage, playerNameTxt
-///   isFriendSlot = false
-///   Empty state  → avatarGO hidden.
-///   Filled state → avatarGO visible.
-///
-/// Avatar Sprites (0-15): drag all 16 sprites in order in every slot's Inspector.
-/// </summary>
 public class PlayerSlotUI : MonoBehaviour
 {
-    [Header("Slot Type")]
-    [SerializeField] private bool isFriendSlot = false; // true only for Slot 2
+    [Header("Filled State")]
+    [SerializeField] private GameObject filledStateGO;
+    [SerializeField] private Image avatarImage;
+    [SerializeField] private Text displayNameTxt;
+    [SerializeField] private Sprite[] avatarSprites;
 
-    [Header("Always Required")]
-    [SerializeField] private GameObject avatarGO;       // Avatar child GO — hidden when empty
-    [SerializeField] private Image      avatarImage;    // Image inside avatarGO
-    [SerializeField] private Text       playerNameTxt;  // Name label
+    [Header("Friend Slot")]
+    public bool isFriendSlot;
+    public GameObject addIconGO;
+    public GameObject popupAddFriendGO;
 
-    [Header("Friend Slot Only (Slot 2)")]
-    [SerializeField] private GameObject addIconGO;          // AddIcon GO — visible when empty
-    [SerializeField] private GameObject popupAddFriendGO;   // PopupAddFriend GO — visible when empty
+    private bool _isEmpty = true;
 
-    [Header("Avatar Sprites (0-15)")]
-    [SerializeField] private Sprite[] avatarSprites = new Sprite[16];
+    // Called from MatchmakingView.ResetView() — 1 param, no animation
+    public void SetLocalPlayer(SlotData data)
+    {
+        _isEmpty = false;
+        if (filledStateGO) filledStateGO.SetActive(true);  // ← ADD
+        if (displayNameTxt) displayNameTxt.text = data.displayName;
+        if (avatarImage != null && avatarSprites != null &&
+            data.avatarIndex >= 0 && data.avatarIndex < avatarSprites.Length)
+            avatarImage.sprite = avatarSprites[data.avatarIndex];
+    }
 
-    // ── Public API ────────────────────────────────────────────────────────────
+    // Called from MatchmakingView.UpdateSlots() — 2 params (SlotData, bool animate)
+    public void SetPlayer(SlotData data, bool animate)
+    {
+        _isEmpty = false;
+        if (filledStateGO) filledStateGO.SetActive(true);  // ← ADD
+        if (displayNameTxt) displayNameTxt.text = data.displayName;
+        if (avatarImage != null && avatarSprites != null &&
+            data.avatarIndex >= 0 && data.avatarIndex < avatarSprites.Length)
+            avatarImage.sprite = avatarSprites[data.avatarIndex];
+        if (animate) PlayJoinAnimation();
+    }
 
-    /// <summary>
-    /// Set slot to empty/waiting state.
-    /// - avatarGO hidden
-    /// - Friend slot: addIconGO + popupAddFriendGO shown
-    /// </summary>
     public void SetEmpty()
     {
-        if (avatarGO != null)      avatarGO.SetActive(false);
-        if (playerNameTxt != null) playerNameTxt.text = "";
-
-        if (isFriendSlot)
-        {
-            if (addIconGO        != null) addIconGO.SetActive(true);
-            if (popupAddFriendGO != null) popupAddFriendGO.SetActive(true);
-        }
+        _isEmpty = true;
+        if (filledStateGO) filledStateGO.SetActive(false);  // ← ADD
     }
 
-    /// <summary>
-    /// Fill this slot with a player or bot.
-    /// - avatarGO shown with correct sprite
-    /// - Friend slot: addIconGO + popupAddFriendGO hidden
-    /// No bot badge shown — bots look identical to real players intentionally.
-    /// </summary>
-    public void SetPlayer(SlotData slot)
+    public bool IsEmpty() => _isEmpty;
+
+    private void PlayJoinAnimation()
     {
-        // Show avatar GO
-        if (avatarGO != null) avatarGO.SetActive(true);
-
-        // Set avatar sprite
-        if (avatarImage != null &&
-            slot.avatarIndex >= 0 &&
-            slot.avatarIndex < avatarSprites.Length &&
-            avatarSprites[slot.avatarIndex] != null)
-        {
-            avatarImage.sprite = avatarSprites[slot.avatarIndex];
-        }
-
-        // Set name
-        if (playerNameTxt != null)
-            playerNameTxt.text = slot.displayName;
-
-        // Friend slot: hide add elements
-        if (isFriendSlot)
-        {
-            if (addIconGO        != null) addIconGO.SetActive(false);
-            if (popupAddFriendGO != null) popupAddFriendGO.SetActive(false);
-        }
+        EventManager.FirePlaySound(SoundType.PlayerFound);
+        transform.DOKill();
+        transform.localScale = Vector3.one;
+        DOTween.Sequence()
+            .Append(transform.DOScale(0.9f, 0.083f).SetEase(Ease.OutQuad))
+            .Append(transform.DOScale(1.1f, 0.084f).SetEase(Ease.OutQuad))
+            .Append(transform.DOScale(1.0f, 0.083f).SetEase(Ease.InOutQuad));
     }
 
-    /// <summary>
-    /// Sets the local player's own avatar and name (Slot 1 only).
-    /// Called once on MatchmakingView enable — this slot never goes empty.
-    /// </summary>
-    public void SetLocalPlayer(string displayName, int avatarIndex)
+    // Called from MatchmakingView.ResetView() — show friend invite affordance
+    public void ShowFriendInviteUI()
     {
-        if (avatarGO != null) avatarGO.SetActive(true);
+        if (!isFriendSlot) return;
+        if (addIconGO)       addIconGO.SetActive(true);
+        if (popupAddFriendGO) popupAddFriendGO.SetActive(true);
+    }
 
-        if (avatarImage != null &&
-            avatarIndex >= 0 &&
-            avatarIndex < avatarSprites.Length &&
-            avatarSprites[avatarIndex] != null)
-        {
-            avatarImage.sprite = avatarSprites[avatarIndex];
-        }
-
-        if (playerNameTxt != null)
-            playerNameTxt.text = displayName;
+    // Called from MatchmakingView.HideAllFriendInviteUI()
+    public void HideFriendInviteUI()
+    {
+        if (!isFriendSlot) return;
+        if (addIconGO)       addIconGO.SetActive(false);
+        if (popupAddFriendGO) popupAddFriendGO.SetActive(false);
     }
 }

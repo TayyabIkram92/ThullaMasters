@@ -1,751 +1,584 @@
-using UnityEngine;
-using UnityEngine.UI;
 using System.Collections;
 using System.Collections.Generic;
 using DG.Tweening;
+using UnityEngine;
+using UnityEngine.UI;
+using TMPro;
 
+/// <summary>
+/// In-game UI. 52 cards pre-spawned (pool). First deal animates; subsequent updates swap sprites.
+/// Shows WinView or LoseView 5 seconds after game ends.
+/// Uses FireLeaveRoomRequested and correct ViewType names.
+/// </summary>
 public class InGameView : MonoBehaviour
 {
-    [System.Serializable]
-    public class ProfileSlot
-    {
-        public Image avatarImage;
-        public Text nameText;
-        public Text remainingCardsText;
-        public Image playedCardImage;
-        public Image timerImage;
-        public Button stealButton;
-        public Text resultText;
+    // ─── Inspector References ────────────────────────────────────────────────
+    [Header("Player Slots (4, clockwise from local)")] [SerializeField]
+    private InGameProfileSlot[] profileSlots;
 
-        [Tooltip(
-            "Debug only: parent Transform where this player's cards are shown when isTesting is true. Leave empty for the local player (seat 0).")]
-        public Transform testHandParent;
-    }
-
-    [Header("Profiles (0=local, 1-3 clockwise)")] [SerializeField]
-    private ProfileSlot[] profiles = new ProfileSlot[4];
-
-    [Header("Cards")] [SerializeField] private Transform cardContainer;
+    [Header("Hand")] [SerializeField] private Transform cardContainer;
     [SerializeField] private GameObject cardPrefab;
-    [SerializeField] private Sprite[] cardSprites = new Sprite[52];
-
-    [Header("Shoot-out")] [SerializeField] private Transform flippedCardsContainer;
-    [SerializeField] private GameObject flippedCardPrefab;
-    [SerializeField] private Sprite cardBackSprite;
 
     [Header("Buttons")] [SerializeField] private Button sortButton;
     [SerializeField] private Button leaveButton;
+    [SerializeField] private Button stealButton;
 
-    [Header("Avatar Sprites (0-15)")] [SerializeField]
-    private Sprite[] avatarSprites = new Sprite[16];
+    [Header("Win/Lose (dialogue views, assign in Inspector)")] [SerializeField]
+    private WinView winView;
 
-    [Header("Debug — Testing Mode")]
-    [Tooltip("When true, shows all opponents' cards face-up inside each profile's testHandParent.")]
-    public bool isTesting = false;
+    [SerializeField] private LoseView loseView;
 
-    // Spawned debug card objects per seat (index 0-3, seat 0 unused / local player)
-    private readonly List<GameObject>[] _debugCards =
-    {
-        new List<GameObject>(), new List<GameObject>(),
-        new List<GameObject>(), new List<GameObject>()
-    };
+    [Header("Card Sprites")] [SerializeField]
+    private Sprite[] cardSprites; // 52 sprites, index = suitIndex*13+rankIndex
 
-    private static readonly int[] SuitSortOrder = { 2, 3, 0, 1 };
-    private static readonly int[] RankSortPriority = { 0, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1 };
+    [SerializeField] private Sprite cardBackSprite;
 
-    private List<SlotData> _seatedPlayers = new List<SlotData>();
-    private List<GameObject> _spawnedCards = new List<GameObject>();
-    private List<GameObject> _flippedCards = new List<GameObject>();
-    private GameState _gs;
+    // ─── Card Pool ───────────────────────────────────────────────────────────
+    private const int CardPoolSize = 52;
+    private readonly List<CardPoolItem> _cardPool = new List<CardPoolItem>(CardPoolSize);
+    private readonly List<CardPoolItem> _handCards = new List<CardPoolItem>();
+
+    // ─── State ───────────────────────────────────────────────────────────────
+    private bool _isFirstDeal = true;
+    private List<CardData> _currentHand = new List<CardData>();
+    private List<SlotData> _seatedPlayers;
+    private GameState _lastGameState;
+    [Header("Testing")] private bool _isSortEnabled = false;
+
+    [SerializeField] private bool isTesting = false;
     private Coroutine _timerCoroutine;
-    private bool _autoSort;
 
-    private void Awake()
-    {
-        if (sortButton != null) sortButton.onClick.AddListener(OnSortClicked);
-        if (leaveButton != null) leaveButton.onClick.AddListener(OnLeaveClicked);
-        for (int i = 0; i < profiles.Length; i++)
-        {
-            if (profiles[i]?.stealButton != null)
-            {
-                int idx = i;
-                profiles[i].stealButton.onClick.AddListener(() => OnStealClicked(idx));
-            }
-        }
-    }
+    // ─── Delay Constants ─────────────────────────────────────────────────────
+    private const float DelayInstant = 0f;
+    private const float DelayTurn = 2f;
 
     private void OnEnable()
     {
-        ResetView();
+        sortButton.onClick.AddListener(OnSortClicked);
+        leaveButton.onClick.AddListener(OnLeaveClicked);
+        if (stealButton) stealButton.onClick.AddListener(OnStealClicked);
+
         EventManager.OnGameReady += HandleGameReady;
-        EventManager.OnGameStateUpdated += HandleGameStateUpdated;
         EventManager.OnLocalHandUpdated += HandleLocalHandUpdated;
+        EventManager.OnGameStateUpdated += HandleGameStateUpdated;
+        EventManager.OnGameFinished += HandleGameFinished;
+
+        InitCardPool();
     }
 
     private void OnDisable()
     {
-        EventManager.OnGameReady -= HandleGameReady;
-        EventManager.OnGameStateUpdated -= HandleGameStateUpdated;
-        EventManager.OnLocalHandUpdated -= HandleLocalHandUpdated;
-        StopTimer();
-        ResetView();
-    }
-
-    private void OnDestroy()
-    {
-        if (sortButton != null) sortButton.onClick.RemoveAllListeners();
-        if (leaveButton != null) leaveButton.onClick.RemoveAllListeners();
-        foreach (var p in profiles)
-            if (p?.stealButton != null)
-                p.stealButton.onClick.RemoveAllListeners();
-    }
-
-    private void HandleGameReady(List<CardData> localHand, List<SlotData> seatedPlayers)
-    {
-        _seatedPlayers = seatedPlayers;
-        _gs = null;
-        _autoSort = false;
-        PopulateProfiles(seatedPlayers);
-        SpawnCards(localHand);
-        HideAllPlayedCards();
-        HideAllTimers();
-        HideFlippedCards();
-    }
-
-    /// <summary>
-    /// Clears all visual state: destroys spawned cards, empties profile names,
-    /// hides result labels and steal buttons.
-    /// Called on OnEnable (before a game starts) and OnDisable (cleanup).
-    /// Safe to call at any time — HandleGameReady repopulates everything fresh
-    /// immediately after OnEnable, so there is no visual flicker or logic gap.
-    /// </summary>
-    private void ResetView()
-    {
-        // Destroy all local player card GameObjects
-        foreach (var go in _spawnedCards)
-            if (go != null) Destroy(go);
-        _spawnedCards.Clear();
-
-        // Destroy all flipped (shootout) cards
-        HideFlippedCards();
-
-        // Destroy all debug hand cards
-        for (int slot = 0; slot < _debugCards.Length; slot++)
-        {
-            foreach (var go in _debugCards[slot])
-                if (go != null) Destroy(go);
-            _debugCards[slot].Clear();
-        }
-
-        // Reset every profile slot to empty visual state
-        foreach (var p in profiles)
-        {
-            if (p == null) continue;
-            if (p.nameText            != null) p.nameText.text = "";
-            if (p.remainingCardsText  != null) p.remainingCardsText.text = "";
-            if (p.avatarImage         != null) p.avatarImage.sprite = null;
-            if (p.playedCardImage     != null) p.playedCardImage.gameObject.SetActive(false);
-            if (p.timerImage          != null) p.timerImage.gameObject.SetActive(false);
-            if (p.stealButton         != null) p.stealButton.gameObject.SetActive(false);
-            if (p.resultText          != null)
-            {
-                p.resultText.text = "";
-                p.resultText.gameObject.SetActive(false);
-            }
-        }
-
-        // Clear runtime state
-        _seatedPlayers.Clear();
-        _gs    = null;
-        _autoSort = false;
-        StopTimer();
-    }
-
-    private void PopulateProfiles(List<SlotData> seatedPlayers)
-    {
-        for (int i = 0; i < profiles.Length; i++)
-        {
-            var slot = profiles[i];
-            if (slot == null) continue;
-            bool hasPlayer = i < seatedPlayers.Count;
-            if (hasPlayer)
-            {
-                var p = seatedPlayers[i];
-                if (slot.avatarImage != null && p.avatarIndex >= 0 && p.avatarIndex < avatarSprites.Length &&
-                    avatarSprites[p.avatarIndex] != null)
-                    slot.avatarImage.sprite = avatarSprites[p.avatarIndex];
-                if (slot.nameText != null) slot.nameText.text = p.displayName;
-                if (slot.remainingCardsText != null) slot.remainingCardsText.text = "13";
-            }
-
-            if (slot.stealButton != null) slot.stealButton.gameObject.SetActive(false);
-            if (slot.resultText != null) slot.resultText.gameObject.SetActive(false);
-            if (slot.playedCardImage != null) slot.playedCardImage.gameObject.SetActive(false);
-            if (slot.timerImage != null) slot.timerImage.gameObject.SetActive(false);
-        }
-    }
-
-    private void HandleGameStateUpdated(GameState gs)
-    {
-        _gs = gs;
-        RefreshRemainingCounts();
-        RefreshPlayedCards();
-        RefreshCardInteractability();
-        RefreshStealButtons();
-        RefreshTimerBar();
-        if (gs.phase == GameState.PhaseShootout) RefreshShootoutView();
-        else HideFlippedCards();
-        if (gs.phase == GameState.PhaseFinished) ShowResults();
-        RefreshDebugHands();
-    }
-
-    private void RefreshRemainingCounts()
-    {
-        if (_gs == null) return;
-        for (int i = 0; i < profiles.Length && i < _seatedPlayers.Count; i++)
-        {
-            if (profiles[i]?.remainingCardsText == null) continue;
-            string pid = _seatedPlayers[i].id;
-            int count = _gs.hands.ContainsKey(pid) ? _gs.hands[pid].Count : 0;
-            profiles[i].remainingCardsText.text = count.ToString();
-        }
-    }
-
-    private void RefreshPlayedCards()
-    {
-        if (_gs == null) return;
-        HideAllPlayedCards();
-        foreach (var pc in _gs.cardsInPlay)
-        {
-            int seat = SeatIndexOf(pc.playerId);
-            if (seat < 0 || seat >= profiles.Length) continue;
-            if (profiles[seat]?.playedCardImage == null) continue;
-            CardData card = CardData.FromShortCode(pc.card);
-            if (card == null) continue;
-            Sprite sp = GetCardSprite(card);
-            if (sp == null) continue;
-            profiles[seat].playedCardImage.sprite = sp;
-            profiles[seat].playedCardImage.gameObject.SetActive(true);
-        }
-    }
-
-    private void HideAllPlayedCards()
-    {
-        foreach (var p in profiles)
-            if (p?.playedCardImage != null)
-                p.playedCardImage.gameObject.SetActive(false);
-    }
-
-    private void RefreshCardInteractability()
-    {
-        if (_gs == null)
-        {
-            SetAllCardsInteractable(false);
-            return;
-        }
-
-        string localId = PlayerDataManager.PlayFabId;
-        bool isMyTurn = _gs.CurrentPlayerId == localId && _gs.phase == GameState.PhasePlaying;
-
-        if (!isMyTurn)
-        {
-            SetAllCardsInteractable(false);
-            return;
-        }
-
-        // BUG 2 FIX: local player already played a card this round (visible in cardsInPlay).
-        // During the 3-second display delay, currentPlayerIndex still points at this player,
-        // so isMyTurn is true — but they must not be able to play another card.
-        // Disable all cards until the round resolves and a new turn begins.
-        foreach (var pc in _gs.cardsInPlay)
-        {
-            if (pc.playerId == localId)
-            {
-                SetAllCardsInteractable(false);
-                return;
-            }
-        }
-
-        // Round 1: special suit restriction
-        if (_gs.roundNumber == 1)
-        {
-            bool isRound1Leader = _gs.cardsInPlay.Count == 0;
-            if (isRound1Leader)
-            {
-                foreach (var go in _spawnedCards)
-                {
-                    if (go == null) continue;
-                    var btn = go.GetComponent<Button>();
-                    if (btn != null) btn.interactable = (go.name == "AS");
-                }
-            }
-            else
-            {
-                bool hasSpade = false;
-                foreach (var go in _spawnedCards)
-                    if (go != null && GetSuit(go.name) == "S")
-                    {
-                        hasSpade = true;
-                        break;
-                    }
-
-                foreach (var go in _spawnedCards)
-                {
-                    if (go == null) continue;
-                    var btn = go.GetComponent<Button>();
-                    if (btn == null) continue;
-                    btn.interactable = hasSpade ? (GetSuit(go.name) == "S") : true;
-                }
-            }
-
-            return;
-        }
-
-        // Normal rounds
-        string leadSuit = _gs.leadSuit;
-        bool isLeading = string.IsNullOrEmpty(leadSuit);
-        bool hasLeadSuit = false;
-        if (!isLeading)
-        {
-            foreach (var go in _spawnedCards)
-                if (go != null && GetSuit(go.name) == leadSuit)
-                {
-                    hasLeadSuit = true;
-                    break;
-                }
-        }
-
-        foreach (var go in _spawnedCards)
-        {
-            if (go == null) continue;
-            var btn = go.GetComponent<Button>();
-            if (btn == null) continue;
-            bool canPlay;
-            if (isLeading) canPlay = true;
-            else if (!hasLeadSuit) canPlay = true;
-            else canPlay = GetSuit(go.name) == leadSuit;
-            btn.interactable = canPlay;
-        }
-    }
-
-    private void SetAllCardsInteractable(bool value)
-    {
-        foreach (var go in _spawnedCards)
-        {
-            if (go == null) continue;
-            var btn = go.GetComponent<Button>();
-            if (btn != null) btn.interactable = value;
-        }
-    }
-
-    private void RefreshTimerBar()
-    {
-        StopTimer();
-        if (_gs == null || _gs.phase == GameState.PhaseFinished)
-        {
-            HideAllTimers();
-            return;
-        }
-
-        string currentId = _gs.CurrentPlayerId;
-        int activeSeat = SeatIndexOf(currentId);
-        HideAllTimers();
-        if (activeSeat < 0 || activeSeat >= profiles.Length) return;
-        if (profiles[activeSeat]?.timerImage == null) return;
-        profiles[activeSeat].timerImage.gameObject.SetActive(true);
-        int totalSecs = _gs.phase == GameState.PhaseShootout ? GameState.ShootoutSeconds : GameState.TurnSeconds;
-        float remaining = _gs.SecondsRemaining(totalSecs);
-        _timerCoroutine = StartCoroutine(TimerBarCoroutine(profiles[activeSeat].timerImage, remaining, totalSecs));
-    }
-
-    private IEnumerator TimerBarCoroutine(Image img, float remaining, float total)
-    {
-        float elapsed = total - remaining;
-        while (elapsed < total)
-        {
-            if (img != null) img.fillAmount = 1f - (elapsed / total);
-            elapsed += Time.deltaTime;
-            yield return null;
-        }
-
-        if (img != null) img.fillAmount = 0f;
-    }
-
-    private void StopTimer()
-    {
+        // ADD in OnDisable:
         if (_timerCoroutine != null)
         {
             StopCoroutine(_timerCoroutine);
             _timerCoroutine = null;
         }
+
+        sortButton.onClick.RemoveListener(OnSortClicked);
+        leaveButton.onClick.RemoveListener(OnLeaveClicked);
+        if (stealButton) stealButton.onClick.RemoveListener(OnStealClicked);
+
+        EventManager.OnGameReady -= HandleGameReady;
+        EventManager.OnLocalHandUpdated -= HandleLocalHandUpdated;
+        EventManager.OnGameStateUpdated -= HandleGameStateUpdated;
+        EventManager.OnGameFinished -= HandleGameFinished;
     }
 
-    private void HideAllTimers()
-    {
-        foreach (var p in profiles)
-            if (p?.timerImage != null)
-                p.timerImage.gameObject.SetActive(false);
-    }
+    // ─── Card Pool ───────────────────────────────────────────────────────────
 
-    private void RefreshStealButtons()
+    private void InitCardPool()
     {
-        if (_gs == null)
-        {
-            HideAllStealButtons();
-            return;
-        }
+        // Only create if not already created
+        if (_cardPool.Count >= CardPoolSize) return;
 
-        string localId = PlayerDataManager.PlayFabId;
-        bool isMyTurn = _gs.CurrentPlayerId == localId;
-        bool isLeading = isMyTurn && string.IsNullOrEmpty(_gs.leadSuit) && _gs.cardsInPlay.Count == 0;
-        for (int i = 0; i < profiles.Length; i++)
+        while (_cardPool.Count < CardPoolSize)
         {
-            if (profiles[i]?.stealButton == null) continue;
-            bool show = false;
-            if (i == 0 && isLeading && _gs.activePlayers.Count > 2)
+            var go = Instantiate(cardPrefab, cardContainer);
+            go.SetActive(false);
+            _cardPool.Add(new CardPoolItem
             {
-                string leftId = GetLeftActivePlayerId();
-                show = !string.IsNullOrEmpty(leftId);
-            }
-
-            profiles[i].stealButton.gameObject.SetActive(show);
+                go = go,
+                img = go.GetComponent<Image>(),
+                btn = go.GetComponent<Button>()
+            });
         }
     }
 
-    private void HideAllStealButtons()
+    private CardPoolItem GetPooledCard()
     {
-        foreach (var p in profiles)
-            if (p?.stealButton != null)
-                p.stealButton.gameObject.SetActive(false);
+        foreach (var item in _cardPool)
+            if (!item.go.activeSelf)
+                return item;
+
+        // Extend
+        var newGo = Instantiate(cardPrefab, cardContainer);
+        newGo.SetActive(false);
+        var newItem = new CardPoolItem
+            { go = newGo, img = newGo.GetComponent<Image>(), btn = newGo.GetComponent<Button>() };
+        _cardPool.Add(newItem);
+        return newItem;
     }
 
-    private string GetLeftActivePlayerId()
+    private void ReturnAllHandCards()
     {
-        if (_gs == null || _seatedPlayers.Count < 2) return "";
-        for (int i = 1; i < _seatedPlayers.Count; i++)
+        foreach (var item in _handCards)
+        {
+            if (item.btn) item.btn.onClick.RemoveAllListeners();
+            item.go.SetActive(false);
+            item.card = null;
+        }
+
+        _handCards.Clear();
+    }
+
+    // ─── Game Ready ──────────────────────────────────────────────────────────
+
+    private void HandleGameReady(List<CardData> hand, List<SlotData> players)
+    {
+        _seatedPlayers = players;
+        _isFirstDeal = true;
+        _currentHand = new List<CardData>(hand);
+
+        SetupProfileSlots(players);
+    }
+
+    private void SetupProfileSlots(List<SlotData> players)
+    {
+        for (int i = 0; i < profileSlots.Length && i < players.Count; i++)
+            profileSlots[i].Setup(players[i]);
+    }
+
+    // ─── Deal Animation (first time only) ────────────────────────────────────
+
+    private IEnumerator DealAnimation(List<CardData> hand)
+    {
+        ReturnAllHandCards();
+        float dealInterval = 0.12f;
+
+        for (int i = 0; i < hand.Count; i++)
+        {
+            var item = GetPooledCard();
+            item.card = hand[i];
+            item.img.sprite = GetCardSprite(hand[i]);
+            item.go.SetActive(true);
+            item.go.transform.localScale = Vector3.zero;
+
+            if (item.btn) item.btn.interactable = false;
+            item.go.transform.DOScale(1f, 0.15f).SetEase(Ease.OutBack);
+            BindCardButton(item);
+            _handCards.Add(item);
+            EventManager.FirePlaySound(SoundType.DealCard);
+            yield return new WaitForSeconds(dealInterval);
+        }
+
+        _isFirstDeal = false;
+        EventManager.FireCardDealAnimationComplete();
+        RedrawHand(_currentHand);
+        ApplyCardInteractability(_lastGameState, DelayInstant); // before first turn — instant
+        if (isTesting) RefreshTestCards(_lastGameState);
+    }
+
+    private void RefreshTestCards(GameState gs)
+    {
+        if (!isTesting || _seatedPlayers == null) return;
+
+        for (int i = 0; i < profileSlots.Length && i < _seatedPlayers.Count; i++)
         {
             string pid = _seatedPlayers[i].id;
-            if (_gs.activePlayers.Contains(pid)) return pid;
-        }
 
-        return "";
-    }
+            List<string> codes = null;
+            if (gs != null && gs.hands != null)
+                gs.hands.TryGetValue(pid, out codes);
 
-    private void SpawnCards(List<CardData> hand)
-    {
-        foreach (var go in _spawnedCards)
-            if (go != null)
-                Destroy(go);
-
-        _spawnedCards.Clear();
-
-        if (cardPrefab == null || cardContainer == null)
-        {
-            Debug.LogError("[InGameView] cardPrefab/cardContainer null.");
-            return;
-        }
-
-        int index = 0;
-
-        foreach (var card in hand)
-        {
-            GameObject go = Instantiate(cardPrefab, cardContainer);
-            go.name = card.ShortCode;
-
-            var img = go.GetComponent<Image>();
-            if (img != null)
+            var sprites = new List<Sprite>();
+            if (codes != null)
             {
-                Sprite sp = GetCardSprite(card);
-                if (sp != null) img.sprite = sp;
+                // Convert to CardData so we can sort
+                var cards = new List<CardData>();
+                foreach (var code in codes)
+                {
+                    var card = CardData.FromShortCode(code);
+                    if (card != null) cards.Add(card);
+                }
+
+                // Apply same sort as local hand if enabled, otherwise default low→high
+                if (_isSortEnabled)
+                    SortHandHighToLow(cards);
+                else
+                    cards.Sort((a, b) =>
+                    {
+                        int s = SuitPriority(a.suitIndex).CompareTo(SuitPriority(b.suitIndex));
+                        if (s != 0) return s;
+                        int rankA = a.rankIndex == 0 ? 13 : a.rankIndex;
+                        int rankB = b.rankIndex == 0 ? 13 : b.rankIndex;
+                        return rankB.CompareTo(rankA);
+                    });
+
+                foreach (var card in cards)
+                    sprites.Add(GetCardSprite(card));
             }
 
-            var btn = go.GetComponent<Button>();
-            if (btn != null)
-            {
-                string code = card.ShortCode;
-                btn.onClick.AddListener(() => OnCardClicked(code));
-                btn.interactable = false;
-            }
-
-            // DOTween animation
-            go.transform.localScale = Vector3.zero;
-
-            float delay = 2f + (index * 0.25f);
-
-            go.transform
-                .DOScale(1f, 0.5f)
-                .SetEase(Ease.OutBack)
-                .SetDelay(delay);
-
-            _spawnedCards.Add(go);
-
-            index++;
+            profileSlots[i].SetTestCards(sprites);
         }
-
-        if (_autoSort) SortCards();
     }
+    // ─── Hand Update ─────────────────────────────────────────────────────────
 
-    private void RemoveCardFromHand(string cardCode)
-    {
-        for (int i = _spawnedCards.Count - 1; i >= 0; i--)
-            if (_spawnedCards[i] != null && _spawnedCards[i].name == cardCode)
-            {
-                Destroy(_spawnedCards[i]);
-                _spawnedCards.RemoveAt(i);
-                return;
-            }
-    }
-
+    // Signature matches EventManager.OnLocalHandUpdated: Action<List<string>, GameState>
     private void HandleLocalHandUpdated(List<string> handCodes, GameState gs)
     {
-        if (gs != null) _gs = gs;
         var hand = new List<CardData>();
         foreach (var code in handCodes)
         {
-            var cd = CardData.FromShortCode(code);
-            if (cd != null) hand.Add(cd);
+            var card = CardData.FromShortCode(code);
+            if (card != null) hand.Add(card);
         }
 
-        SpawnCards(hand);
-        RefreshCardInteractability();
-    }
+        if (_isSortEnabled) SortHandHighToLow(hand);
+        _currentHand = hand;
 
-    private void RefreshShootoutView()
-    {
-        if (_gs == null) return;
-        string drawerId = _gs.shootoutDrawerId;
-        string responderId = "";
-        foreach (var pid in _gs.activePlayers)
-            if (pid != drawerId)
-            {
-                responderId = pid;
-                break;
-            }
-
-        if (string.IsNullOrEmpty(responderId)) return;
-        bool isDrawer = drawerId == PlayerDataManager.PlayFabId;
-        if (!isDrawer)
+        if (_isFirstDeal)
         {
-            HideFlippedCards();
+            // Distribution phases are now complete — start the deal animation with the final hand
+            StartCoroutine(DealAnimation(_currentHand));
             return;
         }
 
-        int cardCount = _gs.hands.ContainsKey(responderId) ? _gs.hands[responderId].Count : 0;
-        SpawnFlippedCards(cardCount);
+
+        RedrawHand(_currentHand);
+        ApplyCardInteractability(gs, DelayInstant); // hand redrawn — instant
+        if (isTesting) RefreshTestCards(gs); // ← ADD
     }
 
-    private void SpawnFlippedCards(int count)
+    private void BindCardButton(CardPoolItem item)
     {
-        HideFlippedCards();
-        if (flippedCardPrefab == null || flippedCardsContainer == null) return;
-        flippedCardsContainer.gameObject.SetActive(true);
-        for (int i = 0; i < count; i++)
-        {
-            GameObject go = Instantiate(flippedCardPrefab, flippedCardsContainer);
-            go.name = $"Flipped_{i}";
-            var img = go.GetComponent<Image>();
-            if (img != null && cardBackSprite != null) img.sprite = cardBackSprite;
-            var btn = go.GetComponent<Button>();
-            if (btn != null) btn.onClick.AddListener(OnFlippedCardClicked);
-            _flippedCards.Add(go);
-        }
+        if (item.btn == null) return;
+        var card = item.card;
+        item.btn.onClick.RemoveAllListeners();
+        item.btn.onClick.AddListener(() => OnCardClicked(card));
     }
 
-    private void HideFlippedCards()
+    private void OnCardClicked(CardData card)
     {
-        foreach (var go in _flippedCards)
-            if (go != null)
-                Destroy(go);
-        _flippedCards.Clear();
-        if (flippedCardsContainer != null) flippedCardsContainer.gameObject.SetActive(false);
+        EventManager.FirePlaySound(SoundType.PlayCard);
+        EventManager.FireLocalCardPlayed(card.ShortCode);
+        ApplyCardInteractability(_lastGameState, DelayInstant); // user played — instant
     }
 
-    // ── DEBUG TESTING MODE ────────────────────────────────────────────────────
-    // When isTesting is true, renders all 3 opponents' hands face-up into the
-    // three debug parent Transforms so the developer can see every card in play.
-    // Cards are sorted the same way as the local hand (suit → rank).
-    // Rebuilds completely on every GameState update so it always reflects reality.
+    // ─── Game State ──────────────────────────────────────────────────────────
 
-    private void RefreshDebugHands()
+    private void HandleGameStateUpdated(GameState state)
     {
-        // Clear all existing debug cards immediately so sibling indices are clean
-        for (int slot = 0; slot < _debugCards.Length; slot++)
-        {
-            foreach (var go in _debugCards[slot])
-                if (go != null)
-                    DestroyImmediate(go);
-            _debugCards[slot].Clear();
-        }
+        _lastGameState = state;
+        UpdateStealButton(state);
+        ApplyCardInteractability(state); // new turn — 2f default delay
 
-        if (!isTesting || _gs == null || cardPrefab == null) return;
+        if (state == null) return;
 
-        // Seats 1, 2, 3 are the opponents — seat 0 is the local player, skip it
-        for (int seatIndex = 1; seatIndex < profiles.Length; seatIndex++)
-        {
-            if (profiles[seatIndex] == null) continue;
-
-            Transform parent = profiles[seatIndex].testHandParent;
-            if (parent == null) continue;
-
-            if (seatIndex >= _seatedPlayers.Count) continue;
-
-            string pid = _seatedPlayers[seatIndex].id;
-            if (!_gs.hands.ContainsKey(pid)) continue;
-
-            var hand = _gs.hands[pid];
-            if (hand == null || hand.Count == 0) continue;
-
-            // Sort: suit first (S→H→D→C), then rank high→low within each suit
-            var sortable = new List<(string code, int key)>();
-            foreach (var code in hand)
+        // ── Card counts ──────────────────────────────────────────────────────
+        if (_seatedPlayers != null)
+            for (int i = 0; i < profileSlots.Length && i < _seatedPlayers.Count; i++)
             {
-                var card = CardData.FromShortCode(code);
-                if (card == null)
+                string pid = _seatedPlayers[i].id;
+                int count = state.hands.ContainsKey(pid) ? state.hands[pid].Count : 0;
+                profileSlots[i].SetCardCount(count);
+            }
+
+        // ── Turn highlight ───────────────────────────────────────────────────
+        string currentId = state.CurrentPlayerId;
+        for (int i = 0; i < profileSlots.Length; i++)
+            profileSlots[i].SetActive(i == GetSlotIndex(currentId));
+
+        // ── Timer coroutine ──────────────────────────────────────────────────
+        if (_timerCoroutine != null)
+        {
+            StopCoroutine(_timerCoroutine);
+            _timerCoroutine = null;
+        }
+
+        if (state.phase != GameState.PhaseFinished && !string.IsNullOrEmpty(currentId))
+        {
+            int slotIdx = GetSlotIndex(currentId);
+            if (slotIdx >= 0 && slotIdx < profileSlots.Length)
+            {
+                float remaining = state.SecondsRemaining(GameState.TurnSeconds);
+                _timerCoroutine = StartCoroutine(
+                    TimerCoroutine(profileSlots[slotIdx], remaining, GameState.TurnSeconds));
+            }
+        }
+
+        // ── Played cards ─────────────────────────────────────────────────────
+        if (state.cardsInPlay == null || state.cardsInPlay.Count == 0)
+        {
+            foreach (var slot in profileSlots)
+                slot.ClearPlayedCard();
+            return;
+        }
+
+        foreach (var played in state.cardsInPlay)
+        {
+            int slotIdx = GetSlotIndex(played.playerId);
+            if (slotIdx < 0 || slotIdx >= profileSlots.Length) continue;
+            var card = CardData.FromShortCode(played.card);
+            if (card != null)
+                profileSlots[slotIdx].ShowPlayedCard(GetCardSprite(card));
+        }
+
+        if (isTesting) RefreshTestCards(state);
+    }
+
+    private IEnumerator TimerCoroutine(InGameProfileSlot slot, float remaining, float total)
+    {
+        float elapsed = total - remaining;
+        while (elapsed < total)
+        {
+            slot.SetTimerValue(total - elapsed, total);
+            elapsed += Time.deltaTime;
+            yield return null;
+        }
+
+        slot.SetTimerValue(0f, total);
+    }
+
+    private void UpdateStealButton(GameState state)
+    {
+        if (stealButton == null) return;
+        bool canSteal = state != null &&
+                        state.phase == "playing" &&
+                        state.leadSuit == "" &&
+                        state.cardsInPlay != null && state.cardsInPlay.Count == 0 && // ADD: not mid-round
+                        state.activePlayers != null &&
+                        state.activePlayers.Count > 2 && // was == 3
+                        state.activePlayers.Count > state.currentPlayerIndex &&
+                        state.activePlayers[state.currentPlayerIndex] == PlayerDataManager.PlayFabId;
+        stealButton.gameObject.SetActive(canSteal);
+    }
+
+    private void ApplyCardInteractability(GameState state, float delay = DelayTurn)
+    {
+        StartCoroutine(ApplyCardInteractabilityCoroutine(state, delay));
+    }
+
+    IEnumerator ApplyCardInteractabilityCoroutine(GameState state, float delay)
+    {
+        if (delay > 0f) yield return new WaitForSeconds(delay);
+
+        // ── Not my turn — all locked ──────────────────────────────────────────
+        if (state == null || state.activePlayers == null ||
+            state.currentPlayerIndex < 0 ||
+            state.currentPlayerIndex >= state.activePlayers.Count ||
+            state.activePlayers[state.currentPlayerIndex] != PlayerDataManager.PlayFabId)
+        {
+            foreach (var item in _handCards)
+                if (item.btn)
+                    item.btn.interactable = false;
+            yield break;
+        }
+
+        // ── already played this round — lock during resolve delay ──
+        string localId = PlayerDataManager.PlayFabId;
+        if (state.cardsInPlay != null)
+            foreach (var pc in state.cardsInPlay)
+                if (pc.playerId == localId)
                 {
-                    sortable.Add((code, int.MaxValue));
-                    continue;
+                    foreach (var item in _handCards)
+                        if (item.btn)
+                            item.btn.interactable = false;
+                    yield break;
                 }
 
-                int sp = System.Array.IndexOf(SuitSortOrder, card.suitIndex);
-                if (sp < 0) sp = 4;
-                int rp = RankSortPriority[card.rankIndex];
-                sortable.Add((code, sp * 13 + rp));
-            }
-
-            sortable.Sort((a, b) => a.key.CompareTo(b.key));
-
-            // Spawn cards in sorted order with explicit sibling index
-            int siblingIdx = 0;
-            int index = 0;
-
-            foreach (var (code, _) in sortable)
-            {
-                var card = CardData.FromShortCode(code);
-                if (card == null) continue;
-
-                GameObject go = Instantiate(cardPrefab, parent);
-                go.name = $"Debug_{code}";
-                go.transform.SetSiblingIndex(siblingIdx++);
-
-                var img = go.GetComponent<Image>();
-                if (img != null)
+        // ── First round special rules ─────────────────────────────────────────
+        if (state.roundNumber == 1)
+        {
+            bool hasAceOfSpades = false;
+            foreach (var item in _handCards)
+                if (item.card != null && item.card.suitIndex == 0 && item.card.rankIndex == 0)
                 {
-                    Sprite sp = GetCardSprite(card);
-                    if (sp != null) img.sprite = sp;
+                    hasAceOfSpades = true;
+                    break;
                 }
 
-                // Display only — no interaction
-                var btn = go.GetComponent<Button>();
-                if (btn != null)
+            if (hasAceOfSpades)
+            {
+                // Rule 6: only Ace of Spades interactable
+                foreach (var item in _handCards)
                 {
-                    btn.interactable = false;
-                    btn.onClick.RemoveAllListeners();
+                    if (item.btn == null) continue;
+                    item.btn.interactable = item.card != null
+                                            && item.card.suitIndex == 0
+                                            && item.card.rankIndex == 0;
                 }
-
-                // DOTween animation
-                go.transform.localScale = Vector3.zero;
-
-                float delay = 2f + (index * 0.25f);
-
-                go.transform
-                    .DOScale(1f, 0.5f)
-                    .SetEase(Ease.OutBack)
-                    .SetDelay(delay);
-
-                _debugCards[seatIndex].Add(go);
-
-                index++;
             }
-        }
-    }
-
-    private void ShowResults()
-    {
-        if (_gs == null) return;
-        HideAllStealButtons();
-        SetAllCardsInteractable(false);
-        for (int i = 0; i < profiles.Length && i < _seatedPlayers.Count; i++)
-        {
-            if (profiles[i]?.resultText == null) continue;
-            string pid = _seatedPlayers[i].id;
-            string label = "";
-            if (_gs.bhabhi == pid) label = "Bhabhi!";
-            else if (_gs.winners.Contains(pid)) label = "Winner!";
-            if (!string.IsNullOrEmpty(label))
+            else
             {
-                profiles[i].resultText.text = label;
-                profiles[i].resultText.gameObject.SetActive(true);
+                // Rule 7: only spade cards interactable
+                foreach (var item in _handCards)
+                {
+                    if (item.btn == null) continue;
+                    item.btn.interactable = item.card != null && item.card.suitIndex == 0;
+                }
             }
-        }
-    }
 
-    private void SortCards()
-    {
-        if (_spawnedCards.Count == 0) return;
-        var sortable = new List<(GameObject go, int key)>();
-        foreach (var go in _spawnedCards)
+            yield break;
+        }
+
+        // Leading (no suit led yet) — all cards playable
+        if (string.IsNullOrEmpty(state.leadSuit))
         {
-            if (go == null) continue;
-            CardData card = CardData.FromShortCode(go.name);
-            if (card == null)
-            {
-                sortable.Add((go, int.MaxValue));
-                continue;
-            }
-
-            int sp = System.Array.IndexOf(SuitSortOrder, card.suitIndex);
-            if (sp < 0) sp = 4;
-            int rp = RankSortPriority[card.rankIndex];
-            sortable.Add((go, sp * 13 + rp));
+            foreach (var item in _handCards)
+                if (item.btn)
+                    item.btn.interactable = true;
+            yield break;
         }
 
-        sortable.Sort((a, b) => a.key.CompareTo(b.key));
-        for (int i = 0; i < sortable.Count; i++) sortable[i].go.transform.SetSiblingIndex(i);
+        // Map leadSuit string to suitIndex: S=0, H=1, C=2, D=3
+        int leadSuitIndex;
+        switch (state.leadSuit)
+        {
+            case "S": leadSuitIndex = 0; break;
+            case "H": leadSuitIndex = 1; break;
+            case "C": leadSuitIndex = 2; break;
+            case "D": leadSuitIndex = 3; break;
+            default:
+                foreach (var item in _handCards)
+                    if (item.btn)
+                        item.btn.interactable = true;
+                yield break;
+        }
+
+        // Following — check if player has any card of lead suit
+        bool hasSuit = false;
+        foreach (var item in _handCards)
+            if (item.card != null && item.card.suitIndex == leadSuitIndex)
+            {
+                hasSuit = true;
+                break;
+            }
+
+        // If has suit — only those cards interactable; otherwise all interactable
+        foreach (var item in _handCards)
+        {
+            if (item.btn == null) continue;
+            item.btn.interactable = !hasSuit || (item.card != null && item.card.suitIndex == leadSuitIndex);
+        }
     }
 
-    private void OnCardClicked(string cardCode)
+    // ─── Game Finished ───────────────────────────────────────────────────────
+
+    private void HandleGameFinished(List<string> winners, string bhabhi)
     {
-        EventManager.FireLocalCardPlayed(cardCode);
+        StartCoroutine(ShowResultAfterDelay(winners, bhabhi));
     }
 
-    private void OnFlippedCardClicked()
+    private IEnumerator ShowResultAfterDelay(List<string> winners, string bhabhi)
     {
-        EventManager.FireShootoutCardChosen();
-        HideFlippedCards();
+        yield return new WaitForSeconds(5f);
+
+        string localId = PlayerDataManager.PlayFabId;
+        bool isWinner = winners != null && winners.Contains(localId);
+        bool isBhabhi = bhabhi == localId;
+
+        if (isWinner)
+        {
+            var room = InGameManager.Instance?.CurrentRoom;
+            int prize = room != null ? Mathf.RoundToInt(room.entryFee * 1.25f) : 0;
+            if (winView != null) winView.Setup(prize);
+            EventManager.FireShowView(ViewType.Win, true);
+        }
+        else if (isBhabhi)
+        {
+            EventManager.FireShowView(ViewType.Lose, true);
+        }
     }
 
-    private void OnStealClicked(int profileIndex)
-    {
-        EventManager.FireStealHandRequested();
-    }
+    // ─── Helpers ─────────────────────────────────────────────────────────────
 
-    private void OnSortClicked()
+    private int GetSlotIndex(string playerId)
     {
-        _autoSort = true;
-        SortCards();
-    }
-
-    private void OnLeaveClicked() => EventManager.FireLeaveGameRequested();
-
-    private int SeatIndexOf(string playerId)
-    {
+        if (_seatedPlayers == null) return -1;
         for (int i = 0; i < _seatedPlayers.Count; i++)
             if (_seatedPlayers[i].id == playerId)
                 return i;
         return -1;
     }
 
-    private string GetSuit(string code)
-    {
-        if (string.IsNullOrEmpty(code)) return "";
-        return code[code.Length - 1].ToString();
-    }
-
     private Sprite GetCardSprite(CardData card)
     {
-        if (card == null) return null;
+        if (card == null || cardSprites == null) return cardBackSprite;
         int idx = card.SpriteIndex;
-        if (idx < 0 || idx >= cardSprites.Length) return null;
-        return cardSprites[idx];
+        return (idx >= 0 && idx < cardSprites.Length) ? cardSprites[idx] : cardBackSprite;
+    }
+
+    // ─── Buttons ─────────────────────────────────────────────────────────────
+
+    private void OnSortClicked()
+    {
+        if (_currentHand == null) return;
+        _isSortEnabled = true;
+        SortHandHighToLow(_currentHand);
+        RedrawHand(_currentHand);
+        ApplyCardInteractability(_lastGameState, DelayInstant); // sort — instant
+    }
+
+    private void SortHandHighToLow(List<CardData> hand)
+    {
+        hand.Sort((a, b) =>
+        {
+            int suitPriorityA = SuitPriority(a.suitIndex);
+            int suitPriorityB = SuitPriority(b.suitIndex);
+            int s = suitPriorityA.CompareTo(suitPriorityB); // suit group first
+            if (s != 0) return s;
+            int rankA = a.rankIndex == 0 ? 13 : a.rankIndex; // Ace = 13
+            int rankB = b.rankIndex == 0 ? 13 : b.rankIndex;
+            return rankB.CompareTo(rankA); // high to low within suit
+        });
+    }
+
+    private int SuitPriority(int suitIndex)
+    {
+        switch (suitIndex)
+        {
+            case 2: return 0; // Clubs    — first
+            case 3: return 1; // Diamonds — second
+            case 0: return 2; // Spades   — third
+            case 1: return 3; // Hearts   — fourth
+            default: return 4;
+        }
+    }
+
+    private void RedrawHand(List<CardData> hand)
+    {
+        ReturnAllHandCards();
+        foreach (var card in hand)
+        {
+            var item = GetPooledCard();
+            item.card = card;
+            item.img.sprite = GetCardSprite(card);
+            item.go.SetActive(true);
+            item.go.transform.localScale = Vector3.one;
+            BindCardButton(item);
+            _handCards.Add(item);
+        }
+    }
+
+    private void OnLeaveClicked()
+    {
+        EventManager.FireLeaveGameRequested(); // was FireLeaveRoomRequested
+        EventManager.FireShowView(ViewType.Home);
+    }
+
+    private void OnStealClicked()
+    {
+        EventManager.FireStealHandRequested(); // was FireLocalCardPlayed("STEAL")
+    }
+
+    // ─── Inner types ─────────────────────────────────────────────────────────
+
+    private class CardPoolItem
+    {
+        public GameObject go;
+        public Image img;
+        public Button btn;
+        public CardData card;
     }
 }

@@ -119,7 +119,9 @@ public class GameManager : MonoBehaviour
         foreach (var kv in _room.hands) _gs.hands[kv.Key] = new List<string>(kv.Value);
 
         BalanceHumanHands();
-
+        string localId = PlayerDataManager.PlayFabId;
+        if (_gs.hands.ContainsKey(localId))
+            _myHand = new List<string>(_gs.hands[localId]);
         LogInitialHandSnapshot();
 
         int startIndex = 0;
@@ -150,6 +152,7 @@ public class GameManager : MonoBehaviour
         _gameActive = true;
         StartListening();
         EventManager.FireGameStateUpdated(_gs);
+        EventManager.FireLocalHandUpdated(new List<string>(_myHand), _gs);
         ProcessCurrentTurn();
     }
 
@@ -259,7 +262,7 @@ public class GameManager : MonoBehaviour
             _gs.activePlayers.Remove(currentId);
             AdjustCurrentIndexAfterRemoval();
 
-            if (CheckGameOver()) return; // Added safety
+            if (CheckGameOver()) return;
 
             WriteGameStateAndProcess();
             return;
@@ -341,7 +344,7 @@ public class GameManager : MonoBehaviour
         _gs.activePlayers.Remove(leftId);
         AdjustCurrentIndexAfterRemoval();
 
-        if (CheckGameOver()) return; // Added safety
+        if (CheckGameOver()) return;
 
         // Reset turn key so ProcessCurrentTurn does not skip as duplicate
         // (same bot is still leading after stealing — round/index unchanged).
@@ -451,6 +454,7 @@ public class GameManager : MonoBehaviour
             Debug.Log("[Steal] No active player found to steal from.");
             return;
         }
+
         if (!_gs.hands.ContainsKey(targetId) || _gs.hands[targetId].Count == 0) return;
 
         // ── Only upgrade the hand when stealing from a bot ────────────────────
@@ -557,9 +561,9 @@ public class GameManager : MonoBehaviour
                 // suit that is strictly greater than the steal card.
                 // For 2s/3s: any higher card of this suit qualifies.
                 // For normal cards: find the highest available upgrade.
-                string bestDonorBot  = null;
+                string bestDonorBot = null;
                 string bestDonorCard = null;
-                int    bestDonorRank = stealRank; // must beat current card
+                int bestDonorRank = stealRank; // must beat current card
 
                 foreach (string botId in otherBots)
                 {
@@ -572,7 +576,7 @@ public class GameManager : MonoBehaviour
 
                     if (candidate != null)
                     {
-                        bestDonorBot  = botId;
+                        bestDonorBot = botId;
                         bestDonorCard = candidate;
                         bestDonorRank = GetRankValue(candidate);
                     }
@@ -617,7 +621,7 @@ public class GameManager : MonoBehaviour
             _gs.activePlayers.Remove(playerId);
             AdjustCurrentIndexAfterRemoval();
 
-            if (CheckGameOver()) return; // Added safety
+            if (CheckGameOver()) return;
 
             WriteGameStateAndProcess();
             return;
@@ -637,6 +641,9 @@ public class GameManager : MonoBehaviour
             _gs.leadSuit = GetSuit(cardCode);
 
         _gs.cardsInPlay.Add(new PlayedCard(playerId, cardCode));
+        EventManager.FirePlaySound(SoundType.PlayCard);
+        bool outOfSuitSound = _gs.cardsInPlay.Count > 1 && GetSuit(cardCode) != _gs.leadSuit;
+        if (outOfSuitSound) EventManager.FirePlaySound(SoundType.ThullaSound);
 
         if (playerId == PlayerDataManager.PlayFabId)
             EventManager.FireLocalHandUpdated(new List<string>(_myHand), _gs);
@@ -915,7 +922,7 @@ public class GameManager : MonoBehaviour
         for (int seatIdx = 0; seatIdx < seatCount; seatIdx++)
         {
             SlotData humanSlot = _seatedPlayers[seatIdx];
-            if (humanSlot.isBot) continue;                          // skip bots
+            if (humanSlot.isBot) continue; // skip bots
             if (!_gs.hands.ContainsKey(humanSlot.id)) continue;
 
             List<string> humanHand = _gs.hands[humanSlot.id];
@@ -924,9 +931,9 @@ public class GameManager : MonoBehaviour
             // Work on a snapshot so we can safely modify the list while iterating.
             List<string> lowCards = humanHand
                 .FindAll(c => GetRankValue(c) == 2
-                           || GetRankValue(c) == 3
-                           || GetRankValue(c) == 13   // King
-                           || GetRankValue(c) == 14); // Ace
+                              || GetRankValue(c) == 3
+                              || GetRankValue(c) == 13 // King
+                              || GetRankValue(c) == 14); // Ace
 
             if (lowCards.Count == 0) continue;
 
@@ -978,7 +985,7 @@ public class GameManager : MonoBehaviour
 
         // ── Count humans vs bots for Pass 3 restriction logic ───────────────
         int humanCount = _seatedPlayers.Count(s => !s.isBot);
-        int botCount   = _seatedPlayers.Count(s =>  s.isBot);
+        int botCount = _seatedPlayers.Count(s => s.isBot);
 
         Debug.Log("[Balance] ── Pass 2: upgrade lower suit cards via next bot ──");
 
@@ -993,14 +1000,14 @@ public class GameManager : MonoBehaviour
             if (string.IsNullOrEmpty(nextBotId)) continue;
 
             List<string> humanHand = _gs.hands[humanSlot.id];
-            List<string> botHand   = _gs.hands[nextBotId];
+            List<string> botHand = _gs.hands[nextBotId];
 
             // Work suit-by-suit
             foreach (string suit in new[] { "S", "H", "D", "C" })
             {
                 // Bot's highest card of this suit
                 string botHighest = GetHighestCardOfSuit(botHand, suit);
-                if (string.IsNullOrEmpty(botHighest)) continue;    // bot has none of this suit
+                if (string.IsNullOrEmpty(botHighest)) continue; // bot has none of this suit
                 int botHighRank = GetRankValue(botHighest);
 
                 // All human cards of this suit that are strictly lower than bot's highest
@@ -1016,9 +1023,9 @@ public class GameManager : MonoBehaviour
                 // Donor cards must not be 2, 3, King(13), or Ace(14) — humans must never hold those.
                 List<string> botHigherCards = botHand
                     .FindAll(c => GetSuit(c) == suit
-                               && GetRankValue(c) > GetRankValue(humanLower[0])
-                               && GetRankValue(c) > 3     // exclude 2 and 3
-                               && GetRankValue(c) < 13)   // exclude King(13) and Ace(14)
+                                  && GetRankValue(c) > GetRankValue(humanLower[0])
+                                  && GetRankValue(c) > 3 // exclude 2 and 3
+                                  && GetRankValue(c) < 13) // exclude King(13) and Ace(14)
                     .OrderByDescending(c => GetRankValue(c))
                     .ToList();
 
@@ -1038,7 +1045,7 @@ public class GameManager : MonoBehaviour
                 for (int i = 0; i < swapCount; i++)
                 {
                     string humanCard = humanLower[i];
-                    string botCard   = botHigherCards[i];
+                    string botCard = botHigherCards[i];
 
                     // Safety: skip if bot card is not actually higher than human card
                     if (GetRankValue(botCard) <= GetRankValue(humanCard)) continue;
@@ -1095,7 +1102,7 @@ public class GameManager : MonoBehaviour
             foreach (string suit in new[] { "S", "H", "D", "C" })
             {
                 int suitCount = humanHand.Count(c => GetSuit(c) == suit);
-                if (suitCount >= 2) continue;   // already has 2+ of this suit
+                if (suitCount >= 2) continue; // already has 2+ of this suit
 
                 int needed = 2 - suitCount;
 
@@ -1103,9 +1110,9 @@ public class GameManager : MonoBehaviour
                 {
                     // Find the best donor card from any bot
                     // Best = highest rank of this suit within allowed range
-                    string bestCard   = null;
-                    string bestBotId  = null;
-                    int    bestRank   = -1;
+                    string bestCard = null;
+                    string bestBotId = null;
+                    int bestRank = -1;
 
                     foreach (SlotData slot in _seatedPlayers)
                     {
@@ -1125,8 +1132,8 @@ public class GameManager : MonoBehaviour
 
                             if (rk > bestRank)
                             {
-                                bestRank  = rk;
-                                bestCard  = c;
+                                bestRank = rk;
+                                bestCard = c;
                                 bestBotId = slot.id;
                             }
                         }
@@ -1142,10 +1149,10 @@ public class GameManager : MonoBehaviour
                     // Prefer: lowest card of any other suit (keep the suit we just got)
                     // Fallback: lowest card overall
                     string swapBack = humanHand
-                        .Where(c => GetSuit(c) != suit)
-                        .OrderBy(c => GetRankValue(c))
-                        .FirstOrDefault()
-                        ?? humanHand.OrderBy(c => GetRankValue(c)).FirstOrDefault();
+                                          .Where(c => GetSuit(c) != suit)
+                                          .OrderBy(c => GetRankValue(c))
+                                          .FirstOrDefault()
+                                      ?? humanHand.OrderBy(c => GetRankValue(c)).FirstOrDefault();
 
                     if (swapBack == null)
                     {
@@ -1158,7 +1165,8 @@ public class GameManager : MonoBehaviour
                     humanHand.Add(bestCard);
                     _gs.hands[bestBotId].Add(swapBack);
 
-                    Debug.Log($"[Balance P3] Human {humanSlot.id} [{swapBack}] ↔ bot {bestBotId} [{bestCard}] (needed {suit} ×{needed})");
+                    Debug.Log(
+                        $"[Balance P3] Human {humanSlot.id} [{swapBack}] ↔ bot {bestBotId} [{bestCard}] (needed {suit} ×{needed})");
                 }
             }
         }
@@ -1179,6 +1187,7 @@ public class GameManager : MonoBehaviour
             if (slot.isBot && _gs.hands.ContainsKey(slot.id) && _gs.hands[slot.id].Count > 0)
                 return slot.id;
         }
+
         return "";
     }
 
@@ -1197,6 +1206,7 @@ public class GameManager : MonoBehaviour
             if (slot.isBot && _gs.hands.ContainsKey(slot.id) && _gs.hands[slot.id].Count > 0)
                 return slot.id;
         }
+
         return "";
     }
 
@@ -1209,18 +1219,28 @@ public class GameManager : MonoBehaviour
     private string GetHighestCardOfSuit(List<string> hand, string suit)
     {
         string bestSafe = "";
-        string bestAny  = "";
-        int    bestSafeRk = -1;
-        int    bestAnyRk  = -1;
+        string bestAny = "";
+        int bestSafeRk = -1;
+        int bestAnyRk = -1;
         foreach (var c in hand)
         {
             if (GetSuit(c) != suit) continue;
             int rk = GetRankValue(c);
-            if (rk > bestAnyRk) { bestAnyRk = rk; bestAny = c; }
+            if (rk > bestAnyRk)
+            {
+                bestAnyRk = rk;
+                bestAny = c;
+            }
+
             // Skip 2, 3, King(13), Ace(14) — humans must never receive these
             if (rk <= 3 || rk >= 13) continue;
-            if (rk > bestSafeRk) { bestSafeRk = rk; bestSafe = c; }
+            if (rk > bestSafeRk)
+            {
+                bestSafeRk = rk;
+                bestSafe = c;
+            }
         }
+
         return !string.IsNullOrEmpty(bestSafe) ? bestSafe : bestAny;
     }
 
@@ -1233,17 +1253,27 @@ public class GameManager : MonoBehaviour
     private string GetHighestCardOfAny(List<string> hand)
     {
         string bestSafe = "";
-        string bestAny  = "";
-        int    bestSafeRk = -1;
-        int    bestAnyRk  = -1;
+        string bestAny = "";
+        int bestSafeRk = -1;
+        int bestAnyRk = -1;
         foreach (var c in hand)
         {
             int rk = GetRankValue(c);
-            if (rk > bestAnyRk) { bestAnyRk = rk; bestAny = c; }
+            if (rk > bestAnyRk)
+            {
+                bestAnyRk = rk;
+                bestAny = c;
+            }
+
             // Skip 2, 3, King(13), Ace(14) — humans must never receive these
             if (rk <= 3 || rk >= 13) continue;
-            if (rk > bestSafeRk) { bestSafeRk = rk; bestSafe = c; }
+            if (rk > bestSafeRk)
+            {
+                bestSafeRk = rk;
+                bestSafe = c;
+            }
         }
+
         return !string.IsNullOrEmpty(bestSafe) ? bestSafe : bestAny;
     }
 
@@ -1345,7 +1375,6 @@ public class GameManager : MonoBehaviour
         _isExecutingMove = false;
         _lastProcessedTurnKey = -1;
         _subRoundIndex = 0;
-        if (_isHost) EventManager.FireAwardGameCoinsRequested(_gs.winners, Mathf.RoundToInt(_room.entryFee * 1.25f));
         EventManager.FireGameFinished(_gs.winners, _gs.bhabhi);
         DumpGameLog();
     }
@@ -1353,7 +1382,10 @@ public class GameManager : MonoBehaviour
     private IEnumerator BotMoveCoroutine(string botId, float delay)
     {
         yield return new WaitForSeconds(delay);
-        if (_gs?.CurrentPlayerId != botId || !_gameActive) yield break;
+        if (!_gameActive || _gs == null) yield break;
+        // Re-check it's still this bot's turn AND they haven't played yet this round
+        if (_gs.CurrentPlayerId != botId) yield break;
+        if (_gs.cardsInPlay.Exists(pc => pc.playerId == botId)) yield break;
         AutoPlay(botId);
     }
 

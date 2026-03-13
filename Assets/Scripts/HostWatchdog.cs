@@ -278,14 +278,6 @@ public class HostWatchdog : MonoBehaviour
 
         EventManager.FireGameFinished(winners, hostId);
 
-        // Award coins only if local player won
-        if (winners.Contains(PlayerDataManager.PlayFabId))
-        {
-            int payout = _room != null ? Mathf.RoundToInt(_room.entryFee * 1.25f) : 0;
-            if (payout > 0)
-                EventManager.FireAwardGameCoinsRequested(winners, payout);
-        }
-
         // Delete room after delay
         StartCoroutine(DeleteRoomAfterDelay(3f));
     }

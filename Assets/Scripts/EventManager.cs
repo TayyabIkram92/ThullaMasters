@@ -1,171 +1,178 @@
 using System;
-using UI;
+using System.Collections.Generic;
 
+// Partial class: UI, Auth, PlayerData, Coins, GameModes, Friends, Sounds, TitleData
 public static partial class EventManager
 {
-    // ── UI Events ─────────────────────────────────────────────────────────────
+    public static event Action<string> OnUpdateCoinsUI;
+    public static void FireUpdateCoinsUI(string coins) => OnUpdateCoinsUI?.Invoke(coins);
 
+    // ─── UI ───────────────────────────────────────────────────────────────────
     public static event Action<ViewType, bool> OnShowView;
-    public static event Action<ViewType> OnHideView;
-    public static event Action OnHideAllViews;
-    public static event Action<string> OnShowPopUp;
 
     public static void FireShowView(ViewType viewType, bool showAsDialogue = false)
         => OnShowView?.Invoke(viewType, showAsDialogue);
 
+    public static event Action<ViewType> OnHideView;
+
     public static void FireHideView(ViewType viewType)
         => OnHideView?.Invoke(viewType);
 
-    public static void FireHideAllViews()
-        => OnHideAllViews?.Invoke();
+    public static event Action<string> OnShowPopUp;
 
-    public static void FireShowPopUp(string message)
-        => OnShowPopUp?.Invoke(message);
+    public static void FireShowPopUp(string message) => OnShowPopUp?.Invoke(message);
 
-    // ── PlayFab Request Events (UI → PlayFab) ─────────────────────────────────
+// Events
+    public static event Action<string, string, bool> OnInviteResponseRequested;
+    public static event Action<string> OnInviteAccepted;
+    public static event Action<string> OnInviteRejected;
+
+// Fire methods
+    public static void FireInviteResponseRequested(string roomId, string senderId, bool accepted)
+        => OnInviteResponseRequested?.Invoke(roomId, senderId, accepted);
+
+    public static void FireInviteAccepted(string playFabId)
+        => OnInviteAccepted?.Invoke(playFabId);
+
+    public static void FireInviteRejected(string playFabId)
+        => OnInviteRejected?.Invoke(playFabId);
+
+    // ─── Auth ─────────────────────────────────────────────────────────────────
+    public static event Action OnAutoLoginRequested;
+    public static void FireAutoLoginRequested() => OnAutoLoginRequested?.Invoke();
+
+    // bool = isLoggedIn — matches LoadingView: void HandleAutoLoginChecked(bool isLoggedIn)
+    public static event Action<bool> OnAutoLoginChecked;
+    public static void FireAutoLoginChecked(bool isLoggedIn) => OnAutoLoginChecked?.Invoke(isLoggedIn);
 
     public static event Action<string, string> OnLoginRequested;
-    public static event Action<string, string> OnRegisterAndLoginRequested;
-    public static event Action OnGuestLoginRequested;
-    public static event Action OnAutoLoginRequested;
 
     public static void FireLoginRequested(string email, string password)
         => OnLoginRequested?.Invoke(email, password);
 
+    // 2 params — matches SignUpLoginView: FireRegisterAndLoginRequested(email, password)
+    public static event Action<string, string> OnRegisterAndLoginRequested;
+
     public static void FireRegisterAndLoginRequested(string email, string password)
         => OnRegisterAndLoginRequested?.Invoke(email, password);
 
-    public static void FireGuestLoginRequested()
-        => OnGuestLoginRequested?.Invoke();
+    public static event Action OnGuestLoginRequested;
+    public static void FireGuestLoginRequested() => OnGuestLoginRequested?.Invoke();
 
-    public static void FireAutoLoginRequested()
-        => OnAutoLoginRequested?.Invoke();
-
-    // ── Username Validation Events ────────────────────────────────────────────
-
-    /// <summary>Request to check if username is available.</summary>
-    public static event Action<string, System.Action<bool>> OnCheckUsernameAvailability;
-
-    public static void FireCheckUsernameAvailability(string username, System.Action<bool> callback)
-        => OnCheckUsernameAvailability?.Invoke(username, callback);
-
-    // ── PlayFab Result Events (PlayFab → UI) ──────────────────────────────────
+    public static event Action OnLogoutRequested;
+    public static void FireLogoutRequested() => OnLogoutRequested?.Invoke();
 
     public static event Action OnAuthSuccess;
+    public static void FireAuthSuccess() => OnAuthSuccess?.Invoke();
+
+    // bool = triedLogin — matches SignUpLoginView: void HandleAuthConflict(bool triedLogin)
     public static event Action<bool> OnAuthConflict;
-    public static event Action<bool> OnAutoLoginChecked;
+    public static void FireAuthConflict(bool triedLogin) => OnAuthConflict?.Invoke(triedLogin);
 
-    public static void FireAuthSuccess()
-        => OnAuthSuccess?.Invoke();
-
-    public static void FireAuthConflict(bool triedLogin)
-        => OnAuthConflict?.Invoke(triedLogin);
-
-    public static void FireAutoLoginChecked(bool isLoggedIn)
-        => OnAutoLoginChecked?.Invoke(isLoggedIn);
-
-    // ── Player Data Events ────────────────────────────────────────────────────
-
-    /// <summary>Fired after player data is fetched and cached.</summary>
+    // ─── PlayerData ───────────────────────────────────────────────────────────
     public static event Action OnPlayerDataLoaded;
+    public static void FirePlayerDataLoaded() => OnPlayerDataLoaded?.Invoke();
 
-    /// <summary>Request to update profile on PlayFab.</summary>
     public static event Action<string, int> OnUpdateProfileRequested;
 
-    /// <summary>Request to award trophy reward coins.</summary>
-    public static event Action OnAwardTrophyRewardRequested;
+    public static void FireUpdateProfileRequested(string username, int avatarIndex)
+        => OnUpdateProfileRequested?.Invoke(username, avatarIndex);
 
-    public static void FirePlayerDataLoaded()
-        => OnPlayerDataLoaded?.Invoke();
+    // 2 params — matches ProfileView: FireCheckUsernameAvailability(username, callback)
+    public static event Action<string, Action<bool>> OnCheckUsernameAvailability;
 
-    public static void FireUpdateProfileRequested(string displayName, int avatarIndex)
-        => OnUpdateProfileRequested?.Invoke(displayName, avatarIndex);
+    public static void FireCheckUsernameAvailability(string username, Action<bool> callback)
+        => OnCheckUsernameAvailability?.Invoke(username, callback);
 
-    public static void FireAwardTrophyRewardRequested()
-        => OnAwardTrophyRewardRequested?.Invoke();
+    public static event Action OnProfileUpdateSuccess;
 
-    // ── Coin Management Events ────────────────────────────────────────────────
+    public static void FireProfileUpdateSuccess() => OnProfileUpdateSuccess?.Invoke();
 
-    /// <summary>Request to deduct coins from PlayFab.</summary>
+// Action<Action<int>> — caller passes a callback, receives coin amount
+    public static event Action<Action<int>> OnGetCoinsRequested;
+
+    public static void FireGetCoinsRequested(Action<int> callback) => OnGetCoinsRequested?.Invoke(callback);
+
+    // ─── Coins ────────────────────────────────────────────────────────────────
+    public static event Action OnFetchCoinsRequested;
+    public static void FireFetchCoinsRequested() => OnFetchCoinsRequested?.Invoke();
+
+    public static event Action<int> OnCoinsUpdated;
+    public static void FireCoinsUpdated(int newAmount) => OnCoinsUpdated?.Invoke(newAmount);
+
+    public static event Action<int, string> OnAddCoinsRequested;
+
+    public static void FireAddCoinsRequested(int amount, string reason)
+        => OnAddCoinsRequested?.Invoke(amount, reason);
+
+    // 1 param — matches ProfileView: FireDeductCoinsRequested(10)
     public static event Action<int> OnDeductCoinsRequested;
 
     public static void FireDeductCoinsRequested(int amount)
         => OnDeductCoinsRequested?.Invoke(amount);
 
-    // ── Game Mode Events ──────────────────────────────────────────────────────
+    public static event Action OnAwardTrophyRewardRequested;
+    public static void FireAwardTrophyRewardRequested() => OnAwardTrophyRewardRequested?.Invoke();
 
-    /// <summary>Request to fetch game mode config from PlayFab.</summary>
+    // ─── GameModes ────────────────────────────────────────────────────────────
     public static event Action OnFetchGameModesRequested;
+    public static void FireFetchGameModesRequested() => OnFetchGameModesRequested?.Invoke();
 
-    /// <summary>Game modes fetched and cached.</summary>
     public static event Action OnGameModesFetched;
+    public static void FireGameModesFetched() => OnGameModesFetched?.Invoke();
 
-    /// <summary>User selected a game mode card.</summary>
     public static event Action<GameModeData> OnGameModeSelected;
 
-    public static void FireFetchGameModesRequested()
-        => OnFetchGameModesRequested?.Invoke();
+    public static void FireGameModeSelected(GameModeData mode)
+        => OnGameModeSelected?.Invoke(mode);
 
-    public static void FireGameModesFetched()
-        => OnGameModesFetched?.Invoke();
-
-    public static void FireGameModeSelected(GameModeData modeData)
-        => OnGameModeSelected?.Invoke(modeData);
-
-    // ── Friends Events ────────────────────────────────────────────────────────
-
-    /// <summary>Request to fetch friends list from PlayFab.</summary>
+    // ─── Friends ──────────────────────────────────────────────────────────────
     public static event Action OnFetchFriendsRequested;
+    public static void FireFetchFriendsRequested() => OnFetchFriendsRequested?.Invoke();
 
-    /// <summary>Friends list fetched and cached.</summary>
     public static event Action OnFriendsFetched;
+    public static void FireFriendsFetched() => OnFriendsFetched?.Invoke();
 
-    /// <summary>Request to add friend by Player ID.</summary>
     public static event Action<string> OnAddFriendRequested;
 
-    /// <summary>Friend added successfully.</summary>
-    public static event Action<FriendData> OnFriendAdded;
+    public static void FireAddFriendRequested(string username)
+        => OnAddFriendRequested?.Invoke(username);
 
-    /// <summary>Failed to add friend (invalid ID, etc.).</summary>
-    public static event Action<string> OnAddFriendFailed;
-
-    /// <summary>Request to remove friend.</summary>
     public static event Action<string> OnRemoveFriendRequested;
 
-    /// <summary>Friend removed successfully.</summary>
-    public static event Action OnFriendRemoved;
+    public static void FireRemoveFriendRequested(string playFabId)
+        => OnRemoveFriendRequested?.Invoke(playFabId);
 
-    public static void FireFetchFriendsRequested()
-        => OnFetchFriendsRequested?.Invoke();
+    public static event Action<string> OnFriendAdded;
+    public static void FireFriendAdded(string playFabId) => OnFriendAdded?.Invoke(playFabId);
 
-    public static void FireFriendsFetched()
-        => OnFriendsFetched?.Invoke();
+    public static event Action<string> OnFriendRemoved;
+    public static void FireFriendRemoved(string playFabId) => OnFriendRemoved?.Invoke(playFabId);
 
-    public static void FireAddFriendRequested(string playerId)
-        => OnAddFriendRequested?.Invoke(playerId);
+    public static event Action<string> OnAddFriendFailed;
+    public static void FireAddFriendFailed(string message) => OnAddFriendFailed?.Invoke(message);
 
-    public static void FireFriendAdded(FriendData friend)
-        => OnFriendAdded?.Invoke(friend);
+    // ─── Sounds ───────────────────────────────────────────────────────────────
 
-    public static void FireAddFriendFailed(string reason)
-        => OnAddFriendFailed?.Invoke(reason);
+    public static event Action<SoundType> OnPlaySound;
+    public static void FirePlaySound(SoundType soundType) => OnPlaySound?.Invoke(soundType);
 
-    public static void FireRemoveFriendRequested(string playfabId)
-        => OnRemoveFriendRequested?.Invoke(playfabId);
-
-    public static void FireFriendRemoved()
-        => OnFriendRemoved?.Invoke();
-
-    // ── Sounds Manager Events ────────────────────────────────────────────────────────
-
-    /// <summary>Request to turn music or sound On/Off.</summary>
     public static event Action<bool> OnTurnMusicOnOrOff;
-
-    public static void FireTurnMusicOnOrOff(bool on)
-        => OnTurnMusicOnOrOff?.Invoke(on);
+    public static void FireTurnMusicOnOrOff(bool on) => OnTurnMusicOnOrOff?.Invoke(on);
 
     public static event Action<bool> OnTurnSoundOnOrOff;
+    public static void FireTurnSoundOnOrOff(bool on) => OnTurnSoundOnOrOff?.Invoke(on);
 
-    public static void FireTurnSoundOnOrOff(bool on)
-        => OnTurnSoundOnOrOff?.Invoke(on);
+    public static event Action<bool> OnMusicStateChanged;
+    public static void FireMusicStateChanged(bool isOn) => OnMusicStateChanged?.Invoke(isOn);
+
+    public static event Action<bool> OnSoundStateChanged;
+    public static void FireSoundStateChanged(bool isOn) => OnSoundStateChanged?.Invoke(isOn);
+
+    // ─── TitleData / Config ───────────────────────────────────────────────────
+    public static event Action OnFetchTitleDataRequested;
+    public static void FireFetchTitleDataRequested() => OnFetchTitleDataRequested?.Invoke();
+
+    public static event Action OnTitleDataFetched;
+    public static void FireTitleDataFetched() => OnTitleDataFetched?.Invoke();
 }

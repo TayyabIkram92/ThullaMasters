@@ -1,64 +1,32 @@
+using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.UI;
-using UI;
+using TMPro;
 
-
-/// <summary>
-/// UI controller for the Matchmaking screen.
-///
-/// Inspector wiring:
-///  - backButton        → BackBtn
-///  - startButton       → StartBtn
-///  - coinsText         → CoinsBar/CoinsTxt
-///  - depositButton     → CoinsBar/DepositBtn
-///  - entryFeeText      → EntryFee/EntryFeeTxt
-///  - searchingText     → FindingPlayers Text
-///  - localSlot         → UserProfile GO          (PlayerSlotUI — isFriendSlot = false)
-///  - friendSlot        → Friend/RandomProfile GO  (PlayerSlotUI — isFriendSlot = true)
-///  - randomSlots[0]    → RandomProfile GO (3rd)   (PlayerSlotUI — isFriendSlot = false)
-///  - randomSlots[1]    → RandomProfile GO (4th)   (PlayerSlotUI — isFriendSlot = false)
-/// </summary>
 public class MatchmakingView : MonoBehaviour
 {
-    [Header("Top Bar")]
+    [Header("Entry Fee")] [SerializeField] private Text entryFeeTxt;
+
+    [Header("Slots")] [SerializeField] private PlayerSlotUI[] playerSlots;
+
+    [Header("Buttons")] [SerializeField] private Button startButton;
     [SerializeField] private Button backButton;
-    [SerializeField] private Text   coinsText;
-    [SerializeField] private Button depositButton;
-
-    [Header("Entry Fee")]
-    [SerializeField] private Text entryFeeText;
-
-    [Header("Player Slots")]
-    [SerializeField] private PlayerSlotUI   localSlot;
-    [SerializeField] private PlayerSlotUI   friendSlot;
-    [SerializeField] private PlayerSlotUI[] randomSlots = new PlayerSlotUI[2];
-
-    [Header("Buttons")]
-    [SerializeField] private Button startButton;
     [SerializeField] private Button addFriendButton;
 
-    [Header("Status Text")]
-    [SerializeField] private Text searchingText;
+    [Header("Status")] [SerializeField] private Text searchingTxt;
 
-    // ── Private State ─────────────────────────────────────────────────────────
-
-    private GameModeData _selectedMode;
-    private bool         _isSearching = false;
-
-    // ── Unity Lifecycle ───────────────────────────────────────────────────────
-
-    private void Awake()
-    {
-        if (backButton      != null) backButton.onClick.AddListener(OnBackClicked);
-        if (startButton     != null) startButton.onClick.AddListener(OnStartClicked);
-        if (depositButton   != null) depositButton.onClick.AddListener(OnDepositClicked);
-        if (addFriendButton != null) addFriendButton.onClick.AddListener(OnAddFriendClicked);
-    }
+    private bool _hasDeductedCoins = false;
+    private bool _matchStarted = false;
+    private RoomData _currentRoom;
 
     private void OnEnable()
     {
-        EventManager.OnRoomUpdated      += HandleRoomUpdated;
-        EventManager.OnMatchFound       += HandleMatchFound;
+        startButton.onClick.AddListener(OnStartClicked);
+        backButton.onClick.AddListener(OnBackClicked);
+        if (addFriendButton) addFriendButton.onClick.AddListener(OnAddFriendClicked);
+
+        EventManager.OnRoomUpdated += HandleRoomUpdated;
+        EventManager.OnMatchFound += HandleMatchFound;
         EventManager.OnMatchmakingError += HandleMatchmakingError;
 
         ResetView();
@@ -66,197 +34,188 @@ public class MatchmakingView : MonoBehaviour
 
     private void OnDisable()
     {
-        EventManager.OnRoomUpdated      -= HandleRoomUpdated;
-        EventManager.OnMatchFound       -= HandleMatchFound;
+        startButton.onClick.RemoveListener(OnStartClicked);
+        backButton.onClick.RemoveListener(OnBackClicked);
+        if (addFriendButton) addFriendButton.onClick.RemoveListener(OnAddFriendClicked);
+
+        EventManager.OnRoomUpdated -= HandleRoomUpdated;
+        EventManager.OnMatchFound -= HandleMatchFound;
         EventManager.OnMatchmakingError -= HandleMatchmakingError;
-
-        HideStatusText();
     }
-
-    private void OnDestroy()
-    {
-        if (backButton      != null) backButton.onClick.RemoveAllListeners();
-        if (startButton     != null) startButton.onClick.RemoveAllListeners();
-        if (depositButton   != null) depositButton.onClick.RemoveAllListeners();
-        if (addFriendButton != null) addFriendButton.onClick.RemoveAllListeners();
-    }
-
-    // ── Setup ─────────────────────────────────────────────────────────────────
 
     private void ResetView()
     {
-        _isSearching = false;
+        _hasDeductedCoins = false;
+        _matchStarted = false;
+        _currentRoom = null;
 
-        // Read selected mode from GameModeManager — set by GameSelectionView
-        // before FireShowView(Matchmaking) so it is always available here
-        _selectedMode = GameModeManager.SelectedMode;
+        // Show entry fee
+        if (entryFeeTxt != null && GameModeManager.SelectedMode != null)
+            entryFeeTxt.text = GameModeManager.SelectedMode.EntryFee.ToString();
 
-        if (coinsText != null)
-            coinsText.text = PlayerDataManager.Coins.ToString();
+        // searchingTxt starts hidden
+        searchingTxt.gameObject.SetActive(false);
 
-        // Slot 1 always shows local player
-        localSlot?.SetLocalPlayer(PlayerDataManager.DisplayName, PlayerDataManager.AvatarIndex);
+        startButton.gameObject.SetActive(true);
+        startButton.interactable = true;
+        backButton.gameObject.SetActive(true);
+        backButton.interactable = true;
+        if (addFriendButton) addFriendButton.gameObject.SetActive(true);
 
-        // Slots 2, 3, 4 start empty
-        friendSlot?.SetEmpty();
-        foreach (var slot in randomSlots)
-            slot?.SetEmpty();
-
-        RefreshEntryFeeText();
-
-        // Hide status text — shown only after Start is pressed
-        HideStatusText();
-        if (searchingText != null)
-            searchingText.gameObject.SetActive(false);
-
-        SetSearchingState(false);
-    }
-
-    private void RefreshEntryFeeText()
-    {
-        if (entryFeeText != null && _selectedMode != null)
-            entryFeeText.text = _selectedMode.EntryFee.ToString();
-    }
-
-    // ── Status Text ───────────────────────────────────────────────────────────
-
-    private void ShowStatusText(string message)
-    {
-        if (searchingText == null) return;
-        searchingText.gameObject.SetActive(true);
-        searchingText.text = message;
-    }
-
-    private void HideStatusText()
-    {
-        if (searchingText == null) return;
-        searchingText.gameObject.SetActive(false);
-        searchingText.text = string.Empty;
-    }
-
-    // ── Event Handlers ────────────────────────────────────────────────────────
-
-    /// <summary>
-    /// Room updated from Firestore — always show local player in slot 1,
-    /// fill remaining slots with everyone else in order.
-    /// Every player sees themselves in slot 1 on their own screen.
-    /// </summary>
-    private void HandleRoomUpdated(RoomData room)
-    {
-        // Update local player slot from room data
-        foreach (var slot in room.players)
+        foreach (var slot in playerSlots)
         {
-            if (slot.id == PlayerDataManager.PlayFabId)
-            {
-                localSlot?.SetLocalPlayer(slot.displayName, slot.avatarIndex);
-                break;
-            }
+            slot.SetEmpty();
+            slot.ShowFriendInviteUI();
         }
 
-        // Collect everyone else
-        var others = new System.Collections.Generic.List<SlotData>();
-        foreach (var slot in room.players)
-            if (slot.id != PlayerDataManager.PlayFabId)
-                others.Add(slot);
-
-        FillOrEmpty(friendSlot,     others, 0);
-        FillOrEmpty(randomSlots[0], others, 1);
-        FillOrEmpty(randomSlots[1], others, 2);
+        if (playerSlots.Length > 0)
+            playerSlots[0].SetLocalPlayer(new SlotData
+            {
+                id = PlayerDataManager.PlayFabId,
+                displayName = PlayerDataManager.DisplayName,
+                avatarIndex = PlayerDataManager.AvatarIndex,
+                isBot = false
+            });
     }
 
-    private void FillOrEmpty(PlayerSlotUI slot, System.Collections.Generic.List<SlotData> others, int index)
+    private void HandleRoomUpdated(RoomData room)
     {
-        if (slot == null) return;
-        if (index < others.Count) slot.SetPlayer(others[index]);
-        else                      slot.SetEmpty();
+        _currentRoom = room;
+        UpdateSlots(room);
+
+        bool allFilled = room.players != null && room.players.Count >= 4;
+
+        if (allFilled && !_hasDeductedCoins)
+        {
+            _hasDeductedCoins = true;
+            DisableStartAndBack();
+
+            if (GameModeManager.SelectedMode != null)
+                // FireDeductCoinsRequested(int) — 1 param
+                EventManager.FireDeductCoinsRequested(GameModeManager.SelectedMode.EntryFee);
+        }
     }
 
-    /// <summary>
-    /// All 4 slots filled — switch animated text to "Joining Game...".
-    /// Navigation to InGame will be wired here once gameplay is implemented.
-    /// </summary>
+    private void UpdateSlots(RoomData room)
+    {
+        for (int i = 1; i < playerSlots.Length; i++)
+            playerSlots[i].SetEmpty();
+
+        if (room.players == null) return;
+
+        int slotIdx = 1;
+        foreach (var player in room.players)
+        {
+            if (player.id == PlayerDataManager.PlayFabId) continue;
+            if (slotIdx >= playerSlots.Length) break;
+            // SetPlayer(SlotData, bool) — 2 params
+            playerSlots[slotIdx].SetPlayer(player, true);
+            slotIdx++;
+        }
+
+        searchingTxt.text = room.players.Count >= 4
+            ? "Match found!"
+            : "Searching... (" + room.players.Count + "/4)";
+    }
+
     private void HandleMatchFound(RoomData room)
     {
-        ShowStatusText("Joining Game...");
-        Debug.Log("[MatchmakingView] Match found — navigating to InGame.");
+        EventManager.FirePlaySound(SoundType.MatchFound);
+        _matchStarted = true;
+        DisableStartAndBack();
+        HideAllFriendInviteUI();
         EventManager.FireShowView(ViewType.InGame);
     }
 
-    private void HandleMatchmakingError(string msg)
+    private void HandleMatchmakingError(string message)
     {
-        HideStatusText();
-        if (searchingText != null)
-            searchingText.gameObject.SetActive(false);
+        searchingTxt.text = "Error: " + message;
+        if (_hasDeductedCoins && GameModeManager.SelectedMode != null)
+        {
+            EventManager.FireAddCoinsRequested(
+                GameModeManager.SelectedMode.EntryFee, "matchmaking_refund");
+            _hasDeductedCoins = false;
+        }
 
-        SetSearchingState(false);
-        _isSearching = false;
-
-        // Refund coins
-        if (_selectedMode != null)
-            PlayerDataManager.AddCoins(_selectedMode.EntryFee);
-
-        if (coinsText != null)
-            coinsText.text = PlayerDataManager.Coins.ToString();
-
-        EventManager.FireShowPopUp(msg);
+        backButton.interactable = true;
     }
 
-    // ── Button Callbacks ──────────────────────────────────────────────────────
-
-    private void OnBackClicked()
+    private void DisableStartAndBack()
     {
-        if (_isSearching)
-            EventManager.FireMatchmakingCancelled();
+        startButton.gameObject.SetActive(false);
+        backButton.gameObject.SetActive(false);
+        if (addFriendButton) addFriendButton.interactable = false;
+    }
 
-        EventManager.FireShowView(ViewType.GameSelection);
+    private void HideAllFriendInviteUI()
+    {
+        foreach (var slot in playerSlots)
+            slot.HideFriendInviteUI(); // PlayerSlotUI.HideFriendInviteUI()
+        if (addFriendButton) addFriendButton.gameObject.SetActive(false);
     }
 
     private void OnStartClicked()
     {
-        if (_isSearching) return;
+        startButton.gameObject.SetActive(false);
+        backButton.gameObject.SetActive(false);
 
-        if (_selectedMode == null)
+        foreach (var slot in playerSlots)
+            slot.HideFriendInviteUI();
+
+        searchingTxt.gameObject.SetActive(true);
+        searchingTxt.text = "Searching... (1/4)";
+
+        if (GameModeManager.SelectedMode != null)
+            EventManager.FireMatchmakingStartRequested(GameModeManager.SelectedMode);
+    }
+
+    private void OnBackClicked()
+    {
+        EventManager.FireMatchmakingCancelRequested();
+
+        if (_hasDeductedCoins && GameModeManager.SelectedMode != null)
         {
-            EventManager.FireShowPopUp("No game mode selected.");
-            return;
+            EventManager.FireAddCoinsRequested(
+                GameModeManager.SelectedMode.EntryFee, "matchmaking_cancelled");
+            _hasDeductedCoins = false;
         }
 
-        if (PlayerDataManager.Coins < _selectedMode.EntryFee)
+        // Delete pre-created room if we were the host and matchmaking never started
+        string preCreatedRoomId = InviteManager.CurrentRoomId;
+        if (!string.IsNullOrEmpty(preCreatedRoomId) && !_matchStarted && FirebaseManager.DB != null)
         {
-            EventManager.FireShowView(ViewType.UserPopUp, showAsDialogue: true);
-            EventManager.FireShowPopUp(
-                $"You need {_selectedMode.EntryFee} coins to enter.\nYou have {PlayerDataManager.Coins} coins.");
-            return;
+            FirebaseManager.DB
+                .Collection("rooms")
+                .Document(preCreatedRoomId)
+                .DeleteAsync();
+
+            InviteManager.ClearCurrentRoomId();
         }
 
-        EventManager.FireDeductCoinsRequested(_selectedMode.EntryFee);
-
-        if (coinsText != null)
-            coinsText.text = PlayerDataManager.Coins.ToString();
-
-        _isSearching = true;
-        SetSearchingState(true);
-
-        ShowStatusText("Searching For Players...");
-
-        EventManager.FireMatchmakingStartRequested(_selectedMode);
+        EventManager.FireShowView(ViewType.GameSelection);
     }
 
-    private void OnDepositClicked()
+    private async void OnAddFriendClicked()
     {
-        Debug.Log("[MatchmakingView] Deposit button clicked.");
-    }
+        if (!FriendsManager.IsInitialized)
+            EventManager.FireFetchFriendsRequested();
 
-    private void OnAddFriendClicked()
-    {
-        EventManager.FireShowView(ViewType.OnlineFriends, showAsDialogue: true);
-    }
+        // Only create room if one doesn't already exist
+        if (string.IsNullOrEmpty(InviteManager.CurrentRoomId))
+        {
+            addFriendButton.interactable = false;
 
-    // ── Helpers ───────────────────────────────────────────────────────────────
+            bool success = await MatchmakingManager.CreateRoomAsync();
 
-    private void SetSearchingState(bool isSearching)
-    {
-        if (startButton != null) startButton.gameObject.SetActive(!isSearching);
-        if (backButton  != null) backButton.gameObject.SetActive(!isSearching);
+            addFriendButton.interactable = true;
+
+            if (!success)
+            {
+                Debug.LogWarning("[MatchmakingView] Room creation failed, cannot open friends list.");
+                return;
+            }
+        }
+
+        EventManager.FireShowView(ViewType.OnlineFriends, true);
     }
 }

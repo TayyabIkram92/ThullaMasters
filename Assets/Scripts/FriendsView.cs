@@ -1,136 +1,128 @@
+using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.UI;
-using UI;
-using System.Collections.Generic;
-using DG.Tweening;
 
 public class FriendsView : MonoBehaviour
 {
-    [Header("UI References")] [SerializeField]
-    private Transform friendCardContainer;
+    [Header("References")] [SerializeField]
+    private Transform cardContainer;
 
-    [SerializeField] private GameObject friendCardPrefab;
+    [SerializeField] private FriendCard cardPrefab;
     [SerializeField] private Button addFriendButton;
-    [SerializeField] private Button inviteButton;
     [SerializeField] private Button closeButton;
-    [SerializeField] private GameObject noFriendsText;
+    [SerializeField] private Button inviteButton;
 
-    private List<GameObject> _instantiatedCards = new List<GameObject>();
-
-    private void Awake()
-    {
-        if (addFriendButton != null)
-            addFriendButton.onClick.AddListener(OnAddFriendClicked);
-
-        if (inviteButton != null)
-            inviteButton.onClick.AddListener(OnInviteClicked);
-
-        if (closeButton != null)
-            closeButton.onClick.AddListener(OnCloseClicked);
-    }
+    private const int InitialPoolSize = 10;
+    private List<FriendCard> _pool = new List<FriendCard>();
+    private List<FriendCard> _active = new List<FriendCard>();
 
     private void OnEnable()
     {
-        EventManager.OnFriendAdded += HandleFriendAdded;
+        addFriendButton.onClick.AddListener(OnAddFriendClicked);
+        closeButton.onClick.AddListener(OnCloseClicked);
+        if (inviteButton != null)
+            inviteButton.onClick.AddListener(OnInviteClicked);
+        EventManager.OnFriendsFetched += HandleFriendsFetched;
+        EventManager.OnFriendAdded += HandleFriendListChanged;
         EventManager.OnFriendRemoved += HandleFriendRemoved;
 
-        SpawnFriendCards();
+        EnsurePool();
+        RefreshList();
+
+        if (!FriendsManager.IsInitialized)
+            EventManager.FireFetchFriendsRequested();
     }
 
     private void OnDisable()
     {
-        EventManager.OnFriendAdded -= HandleFriendAdded;
-        EventManager.OnFriendRemoved -= HandleFriendRemoved;
-
-        DestroyAllCards();
-    }
-
-    private void OnDestroy()
-    {
-        if (addFriendButton != null) addFriendButton.onClick.RemoveAllListeners();
+        addFriendButton.onClick.RemoveListener(OnAddFriendClicked);
+        closeButton.onClick.RemoveListener(OnCloseClicked);
         if (inviteButton != null) inviteButton.onClick.RemoveAllListeners();
-        if (closeButton != null) closeButton.onClick.RemoveAllListeners();
+
+        EventManager.OnFriendsFetched -= HandleFriendsFetched;
+        EventManager.OnFriendAdded -= HandleFriendListChanged;
+        EventManager.OnFriendRemoved -= HandleFriendRemoved;
     }
 
-    private void SpawnFriendCards()
+    private void EnsurePool()
     {
-        DestroyAllCards();
-
-        if (!FriendsManager.IsInitialized || FriendsManager.Friends.Count == 0)
+        while (_pool.Count < InitialPoolSize)
         {
-            if (noFriendsText != null)
-                noFriendsText.SetActive(true);
-            return;
-        }
-
-        if (noFriendsText != null)
-            noFriendsText.SetActive(false);
-
-        float baseDelay = 0.5f;
-        float delayIncrement = 0.25f;
-        int index = 0;
-
-        foreach (var friendData in FriendsManager.Friends)
-        {
-            GameObject cardObj = Instantiate(friendCardPrefab, friendCardContainer);
-
-            FriendCard card = cardObj.GetComponent<FriendCard>();
-            if (card != null)
-                card.Initialize(friendData);
-
-            // Start scale at 0
-            cardObj.transform.localScale = Vector3.zero;
-
-            // Calculate delay
-            float delay = baseDelay + (index * delayIncrement);
-
-            // Animate
-            cardObj.transform
-                .DOScale(1f, 0.5f)
-                .SetEase(Ease.OutBack)
-                .SetDelay(delay);
-
-            _instantiatedCards.Add(cardObj);
-
-            index++;
+            var card = Instantiate(cardPrefab, cardContainer);
+            card.gameObject.SetActive(false);
+            _pool.Add(card);
         }
     }
 
-    private void DestroyAllCards()
+    private FriendCard GetFromPool()
     {
-        foreach (var card in _instantiatedCards)
+        foreach (var card in _pool)
+            if (!card.gameObject.activeSelf)
+            {
+                card.gameObject.SetActive(true);
+                return card;
+            }
+
+        var newCard = Instantiate(cardPrefab, cardContainer);
+        _pool.Add(newCard);
+        newCard.gameObject.SetActive(true);
+        return newCard;
+    }
+
+    private void ReturnAllToPool()
+    {
+        foreach (var card in _active)
+            card.gameObject.SetActive(false);
+        _active.Clear();
+    }
+
+    private void RefreshList()
+    {
+        ReturnAllToPool();
+        var friends = FriendsManager.Friends;
+        for (int i = 0; i < friends.Count; i++)
         {
-            if (card != null)
-                Destroy(card);
+            var card = GetFromPool();
+            card.Setup(friends[i], i + 1, OnDeleteRequested);
+            _active.Add(card);
         }
-
-        _instantiatedCards.Clear();
-    }
-
-    private void HandleFriendAdded(FriendData friend)
-    {
-        SpawnFriendCards();
-    }
-
-    private void HandleFriendRemoved()
-    {
-        SpawnFriendCards();
-    }
-
-    private void OnAddFriendClicked()
-    {
-        EventManager.FireShowView(ViewType.AddFriend, showAsDialogue: true);
     }
 
     private void OnInviteClicked()
     {
-        string playerName = PlayerDataManager.DisplayName;
-        string appUrl = "https://play.google.com/store/apps/details?id=com.yourcompany.thullamasters";
+        string playerUsername = PlayerDataManager.DisplayName;
+        string appUrl =
+            "https://play.google.com/store/apps/details?id=com.yourcompany.thullamasters"; // Update with your actual URL
 
-        string message = $"Play Thulla Masters with me!\n\nMy Username: {playerName}\n\nDownload: {appUrl}";
+        string message = $"Play Thulla Masters with me! My ID: {playerUsername}. Download: {appUrl}";
         string encodedMessage = UnityEngine.Networking.UnityWebRequest.EscapeURL(message);
 
-        Application.OpenURL($"https://wa.me/?text={encodedMessage}");
+        string whatsappUrl = $"https://wa.me/?text={encodedMessage}";
+
+        Application.OpenURL(whatsappUrl);
+
+        Debug.Log($"[FriendsView] Opening WhatsApp with invite message.");
+    }
+
+    private void OnDeleteRequested(FriendData friend)
+    {
+        PlayerPrefs.SetString("PendingDeleteFriendId", friend.PlayFabId);
+        PlayerPrefs.SetString("PendingDeleteFriendName", friend.DisplayName);
+        PlayerPrefs.Save();
+        // Show as dialogue — FriendsView stays active underneath
+        EventManager.FireShowView(ViewType.DeleteFriend, true);
+    }
+
+    private void HandleFriendsFetched() => RefreshList();
+
+    private void HandleFriendListChanged(string playFabId) => RefreshList();
+
+    private void HandleFriendRemoved(string playFabId) => RefreshList();
+
+    private void OnAddFriendClicked()
+    {
+        // Show as dialogue — FriendsView stays active
+        EventManager.FireShowView(ViewType.AddFriend, true);
     }
 
     private void OnCloseClicked()

@@ -1,6 +1,5 @@
 using System.Collections;
 using UnityEngine;
-using UI;
 
 public class LoadingView : MonoBehaviour
 {
@@ -10,13 +9,13 @@ public class LoadingView : MonoBehaviour
 
     private void OnEnable()
     {
+        EventManager.OnAutoLoginChecked += HandleAutoLoginChecked;
         StartCoroutine(StartGame());
     }
 
     IEnumerator StartGame()
     {
         yield return new WaitForSeconds(loadingTime);
-        EventManager.OnAutoLoginChecked += HandleAutoLoginChecked;
 
         if (!_hasRequested)
         {
@@ -29,7 +28,6 @@ public class LoadingView : MonoBehaviour
     {
         EventManager.OnAutoLoginChecked -= HandleAutoLoginChecked;
 
-        // Clean up data listener if we were waiting
         if (_isWaitingForData)
         {
             EventManager.OnPlayerDataLoaded -= HandlePlayerDataLoaded;
@@ -39,28 +37,24 @@ public class LoadingView : MonoBehaviour
         _hasRequested = false;
     }
 
+    // Signature matches Action<bool>
     private void HandleAutoLoginChecked(bool isLoggedIn)
     {
         if (isLoggedIn)
         {
-            // User found — wait for data to load
             _isWaitingForData = true;
             EventManager.OnPlayerDataLoaded += HandlePlayerDataLoaded;
         }
         else
         {
-            // User not found — go to SignUpLogin
             EventManager.FireShowView(ViewType.SignUpLogin);
         }
     }
 
     private void HandlePlayerDataLoaded()
     {
-        // Unsubscribe immediately
         EventManager.OnPlayerDataLoaded -= HandlePlayerDataLoaded;
         _isWaitingForData = false;
-
-        // Navigate to Home
         EventManager.FireShowView(ViewType.Home);
     }
 }

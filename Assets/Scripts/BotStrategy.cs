@@ -82,7 +82,7 @@ public class BotStrategy
         foreach (var c in cards)
         {
             _discardPile.Add(c);
-            _knownCards.Add(c);  // also mark as seen/known
+            _knownCards.Add(c); // also mark as seen/known
         }
     }
 
@@ -133,42 +133,6 @@ public class BotStrategy
         if (gs.roundNumber == 1)
             return ChooseFirstTurnCard(gs, botId, hand);
 
-        // ── 1v1 STRATEGY ──────────────────────────────────────────────────
-        // Exactly 1 bot vs 1 human.
-        // LEADING:   player has 1 card of suit  -> play highest bot card BELOW player's card
-        //            player has 2+ cards of suit -> play bot's HIGHEST card of that suit
-        // FOLLOWING: player played last of suit (0 left) -> play highest bot card BELOW played card
-        //            player has 1+ cards of suit remaining -> play bot's HIGHEST card of that suit
-        // OUT-OF-SUIT: unchanged, falls through to normal FollowingLogic.
-        if (gs.activePlayers.Count == 2)
-        {
-            string opponentId = gs.activePlayers.FirstOrDefault(p => p != botId);
-            if (opponentId != null && gs.hands.ContainsKey(opponentId))
-            {
-                bool isLeading1v1 = string.IsNullOrEmpty(gs.leadSuit);
-                if (isLeading1v1)
-                {
-                    string lead1v1 = OneVsOneLeading(gs, botId, hand, opponentId);
-                    if (lead1v1 != null)
-                    {
-                        Debug.Log($"[BotStrategy] 1v1 lead -> {lead1v1}");
-                        return lead1v1;
-                    }
-                    // No suit available -> fall through to normal LeadingLogic
-                }
-                else
-                {
-                    string follow1v1 = OneVsOneFollowing(gs, botId, hand, opponentId);
-                    if (follow1v1 != null)
-                    {
-                        Debug.Log($"[BotStrategy] 1v1 follow -> {follow1v1}");
-                        return follow1v1;
-                    }
-                    // Bot void in lead suit -> fall through to normal FollowingLogic (out-of-suit)
-                }
-            }
-        }
-
         bool isLeading = string.IsNullOrEmpty(gs.leadSuit);
         return isLeading
             ? LeadingLogic(gs, botId, hand)
@@ -192,122 +156,17 @@ public class BotStrategy
         return DiscardUsingLowestSuitAlgorithm(hand, "S");
     }
 
-    // ════════════════════════════════════════════════════════════════
-    //  1v1 LEADING
-    //
-    //  Iterates every suit. For each suit:
-    //    player has exactly 1 card -> Rule 1: play highest bot card BELOW player's card
-    //    player has 2+ cards       -> Rule 2: play bot's HIGHEST card of that suit
-    //  Among all qualifying suits, pick the one that gives the highest bot card.
-    //  Returns null if bot has no cards of any suit the player holds.
-    // ════════════════════════════════════════════════════════════════
-
-    private string OneVsOneLeading(GameState gs, string botId,
-                                   List<string> hand, string opponentId)
-    {
-        var opponentHand = gs.hands[opponentId];
-        string bestCard = null;
-        int    bestRank = -1;
-
-        foreach (string suit in AllSuits)
-        {
-            var opponentSuitCards = opponentHand
-                .Where(c => GetSuit(c) == suit).ToList();
-
-            if (opponentSuitCards.Count == 0) continue; // bot skips suits player doesn't have
-
-            var botSuitCards = hand.Where(c => GetSuit(c) == suit).ToList();
-            if (botSuitCards.Count == 0) continue;
-
-            string candidate;
-
-            if (opponentSuitCards.Count == 1)
-            {
-                // Rule 1: player has exactly 1 card of suit
-                // Play bot's highest card that is LOWER than player's card
-                int opponentRank = GetRankValue(opponentSuitCards[0]);
-                var below = botSuitCards
-                    .Where(c => GetRankValue(c) < opponentRank).ToList();
-                if (below.Count == 0) continue; // all bot cards >= player's, skip
-                candidate = HighestCard(below);
-            }
-            else
-            {
-                // Rule 2: player has 2+ cards of suit -> play bot's highest
-                candidate = HighestCard(botSuitCards);
-            }
-
-            int rank = GetRankValue(candidate);
-            if (rank > bestRank) { bestRank = rank; bestCard = candidate; }
-        }
-
-        return bestCard; // null = no playable suit found, use normal LeadingLogic
-    }
-
-    // ════════════════════════════════════════════════════════════════
-    //  1v1 FOLLOWING
-    //
-    //  leadSuit = suit player just led.
-    //  playerSuitRemaining = player's cards of leadSuit EXCLUDING the card just played.
-    //
-    //    playerSuitRemaining == 0 (played last of suit) -> Rule 1:
-    //      play bot's highest card of leadSuit that is LOWER than player's played card.
-    //      If no bot card is lower, play bot's lowest card of that suit (unavoidable).
-    //
-    //    playerSuitRemaining >= 1 (still has cards of suit) -> Rule 2:
-    //      play bot's HIGHEST card of leadSuit.
-    //
-    //  Returns null if bot is void in leadSuit (caller uses normal out-of-suit logic).
-    // ════════════════════════════════════════════════════════════════
-
-    private string OneVsOneFollowing(GameState gs, string botId,
-                                     List<string> hand, string opponentId)
-    {
-        string leadSuit   = gs.leadSuit;
-        var botSuitCards  = hand.Where(c => GetSuit(c) == leadSuit).ToList();
-
-        // Bot void in lead suit -> caller handles out-of-suit discard
-        if (botSuitCards.Count == 0) return null;
-
-        // Find the card player just played (first entry in cardsInPlay)
-        string playedCard = gs.cardsInPlay.Count > 0 ? gs.cardsInPlay[0].card : "";
-        int    playedRank = GetRankValue(playedCard);
-
-        // Count how many cards of leadSuit player still has AFTER playing
-        var opponentHand        = gs.hands[opponentId];
-        int playerSuitRemaining = opponentHand
-            .Count(c => GetSuit(c) == leadSuit); // played card already removed from gs.hands
-
-        if (playerSuitRemaining == 0)
-        {
-            // Rule 1: player played their last card of this suit
-            // Play bot's highest card that is LOWER than player's played card
-            var below = botSuitCards
-                .Where(c => GetRankValue(c) < playedRank)
-                .ToList();
-
-            if (below.Count > 0)
-                return HighestCard(below);
-
-            // No bot card lower than player's card -> play lowest to minimise damage
-            return LowestCard(botSuitCards);
-        }
-
-        // Rule 2: player still has 1+ cards of suit remaining -> play bot's highest
-        return HighestCard(botSuitCards);
-    }
-
     // ═══════════════════════════════════════════════════════════════════════
     //  LEADING LOGIC
     // ═══════════════════════════════════════════════════════════════════════
 
     private string LeadingLogic(GameState gs, string botId, List<string> hand)
     {
-        var active   = gs.activePlayers;
-        int myIndex  = active.IndexOf(botId);
+        var active = gs.activePlayers;
+        int myIndex = active.IndexOf(botId);
         if (myIndex < 0) return hand[0];
 
-        string nextId   = active[(myIndex + 1) % active.Count];
+        string nextId = active[(myIndex + 1) % active.Count];
         string secondId = active.Count >= 3 ? active[(myIndex + 2) % active.Count] : null;
 
         // ── Rule 0 : Dominant suits ──────────────────────────────────────────
@@ -420,15 +279,15 @@ public class BotStrategy
         // ══════════════════════════════════════════════════════════════════
 
         string leadSuit = gs.leadSuit;
-        var active      = gs.activePlayers;
-        int myIndex     = active.IndexOf(botId);
+        var active = gs.activePlayers;
+        int myIndex = active.IndexOf(botId);
         if (myIndex < 0) return hand[0];
 
-        string nextId   = active[(myIndex + 1) % active.Count];
+        string nextId = active[(myIndex + 1) % active.Count];
         string secondId = active.Count >= 3 ? active[(myIndex + 2) % active.Count] : null;
 
         var suitCards = hand.Where(c => GetSuit(c) == leadSuit)
-                            .OrderByDescending(GetRankValue).ToList();
+            .OrderByDescending(GetRankValue).ToList();
 
         if (suitCards.Count > 0)
         {
@@ -578,15 +437,15 @@ public class BotStrategy
 
     private string FindTrapCard(SimState sim, string botId, List<string> hand)
     {
-        var active   = sim.activePlayers;
-        int myIndex  = active.IndexOf(botId);
+        var active = sim.activePlayers;
+        int myIndex = active.IndexOf(botId);
         if (myIndex < 0 || active.Count < 2) return null;
 
-        string nextId   = active[(myIndex + 1) % active.Count];
+        string nextId = active[(myIndex + 1) % active.Count];
         string secondId = active.Count >= 3 ? active[(myIndex + 2) % active.Count] : null;
 
         var dominantSuits = BuildDominantSuitsFromSim(sim, botId, hand);
-        var sortedHand    = hand.OrderByDescending(GetRankValue).ToList();
+        var sortedHand = hand.OrderByDescending(GetRankValue).ToList();
 
         // Rule 1: clean-round card
         foreach (var card in sortedHand)
@@ -644,9 +503,9 @@ public class BotStrategy
     /// </summary>
     private struct SimState
     {
-        public List<string>              activePlayers;
+        public List<string> activePlayers;
         public Dictionary<string, List<string>> hands;
-        public HashSet<string>           voids; // flat: "pid|suit"
+        public HashSet<string> voids; // flat: "pid|suit"
     }
 
     private SimState CloneToSim(GameState gs, string botId)
@@ -654,14 +513,14 @@ public class BotStrategy
         var sim = new SimState
         {
             activePlayers = new List<string>(gs.activePlayers),
-            hands         = new Dictionary<string, List<string>>(),
-            voids         = new HashSet<string>()
+            hands = new Dictionary<string, List<string>>(),
+            voids = new HashSet<string>()
         };
         foreach (var kv in gs.hands)
             sim.hands[kv.Key] = new List<string>(kv.Value);
         foreach (var kv in _knownVoids)
-            foreach (var s in kv.Value)
-                sim.voids.Add(kv.Key + "|" + s);
+        foreach (var s in kv.Value)
+            sim.voids.Add(kv.Key + "|" + s);
         return sim;
     }
 
@@ -673,13 +532,13 @@ public class BotStrategy
         gs.activePlayers = new List<string>(sim.activePlayers);
         foreach (var kv in sim.hands)
             gs.hands[kv.Key] = new List<string>(kv.Value);
-        gs.roundNumber  = original.roundNumber + 1;
-        gs.leadSuit     = "";
-        gs.cardsInPlay  = new List<PlayedCard>();
+        gs.roundNumber = original.roundNumber + 1;
+        gs.leadSuit = "";
+        gs.cardsInPlay = new List<PlayedCard>();
         gs.turnStartTime = original.turnStartTime;
-        gs.phase        = original.phase;
-        gs.winners      = new List<string>(original.winners);
-        gs.bhabhi       = original.bhabhi;
+        gs.phase = original.phase;
+        gs.winners = new List<string>(original.winners);
+        gs.bhabhi = original.bhabhi;
         return gs;
     }
 
@@ -693,20 +552,20 @@ public class BotStrategy
     private string SimulateTrick(SimState sim, string botId, string leadCard)
     {
         string suit = GetSuit(leadCard);
-        var active  = sim.activePlayers;
-        int myIdx   = active.IndexOf(botId);
+        var active = sim.activePlayers;
+        int myIdx = active.IndexOf(botId);
 
         // Remove bot's lead card
         if (sim.hands.ContainsKey(botId))
             sim.hands[botId].Remove(leadCard);
 
-        string winnerId   = botId;
-        int    winnerRank = GetRankValue(leadCard);
+        string winnerId = botId;
+        int winnerRank = GetRankValue(leadCard);
 
         // Each other player responds
         for (int offset = 1; offset < active.Count; offset++)
         {
-            string pid  = active[(myIdx + offset) % active.Count];
+            string pid = active[(myIdx + offset) % active.Count];
             if (!sim.hands.ContainsKey(pid) || sim.hands[pid].Count == 0) continue;
 
             List<string> pHand = sim.hands[pid];
@@ -718,7 +577,11 @@ public class BotStrategy
                 // Play highest of suit (simplified opponent behaviour)
                 played = HighestCard(suitCards);
                 int rank = GetRankValue(played);
-                if (rank > winnerRank) { winnerRank = rank; winnerId = pid; }
+                if (rank > winnerRank)
+                {
+                    winnerRank = rank;
+                    winnerId = pid;
+                }
             }
             else
             {
@@ -750,14 +613,16 @@ public class BotStrategy
     private bool SimPlayerHasGreater(SimState sim, string pid, string refCard)
     {
         if (!sim.hands.ContainsKey(pid)) return false;
-        string suit = GetSuit(refCard); int rank = GetRankValue(refCard);
+        string suit = GetSuit(refCard);
+        int rank = GetRankValue(refCard);
         return sim.hands[pid].Any(c => GetSuit(c) == suit && GetRankValue(c) > rank);
     }
 
     private bool SimPlayerHasLower(SimState sim, string pid, string refCard)
     {
         if (!sim.hands.ContainsKey(pid)) return false;
-        string suit = GetSuit(refCard); int rank = GetRankValue(refCard);
+        string suit = GetSuit(refCard);
+        int rank = GetRankValue(refCard);
         return sim.hands[pid].Any(c => GetSuit(c) == suit && GetRankValue(c) < rank);
     }
 
@@ -767,9 +632,10 @@ public class BotStrategy
         foreach (string s in AllSuits)
         {
             int remaining = 13 - _discardPile.Count(c => GetSuit(c) == s);
-            int myCount   = hand.Count(c => GetSuit(c) == s);
+            int myCount = hand.Count(c => GetSuit(c) == s);
             if (myCount >= remaining - 1) dom.Add(s);
         }
+
         return dom;
     }
 
@@ -829,18 +695,18 @@ public class BotStrategy
             return chosenCard;
         }
 
-        string suit    = GetSuit(chosenCard);
-        int    myRank  = GetRankValue(chosenCard);
+        string suit = GetSuit(chosenCard);
+        int myRank = GetRankValue(chosenCard);
 
         // Find the highest card of the same suit across all other active bots
         string bestUpgradeCard = null;
-        string bestUpgradePid  = null;
-        int    bestUpgradeRank = myRank; // must strictly beat current card
+        string bestUpgradePid = null;
+        int bestUpgradeRank = myRank; // must strictly beat current card
 
         foreach (string pid in gs.activePlayers)
         {
-            if (pid == botId) continue;                        // skip self
-            if (!pid.StartsWith("BOT_")) continue;            // only swap with other bots
+            if (pid == botId) continue; // skip self
+            if (!pid.StartsWith("BOT_")) continue; // only swap with other bots
             if (!gs.hands.ContainsKey(pid)) continue;
 
             foreach (string c in gs.hands[pid])
@@ -851,7 +717,7 @@ public class BotStrategy
                 {
                     bestUpgradeRank = r;
                     bestUpgradeCard = c;
-                    bestUpgradePid  = pid;
+                    bestUpgradePid = pid;
                 }
             }
         }
@@ -865,7 +731,8 @@ public class BotStrategy
         gs.hands[botId].Add(bestUpgradeCard);
         gs.hands[bestUpgradePid].Add(chosenCard);
 
-        Debug.Log($"[Discard Upgrade] Bot {botId} [{chosenCard}] ↔ Bot {bestUpgradePid} [{bestUpgradeCard}] — playing {bestUpgradeCard}");
+        Debug.Log(
+            $"[Discard Upgrade] Bot {botId} [{chosenCard}] ↔ Bot {bestUpgradePid} [{bestUpgradeCard}] — playing {bestUpgradeCard}");
 
         return bestUpgradeCard;
     }
@@ -890,7 +757,7 @@ public class BotStrategy
         var candidates = byS.Where(kv => kv.Value.Count == minCount).ToList();
         if (candidates.Count == 1) return HighestCard(candidates[0].Value);
 
-        int maxVal    = candidates.Max(kv => kv.Value.Sum(GetRankValue));
+        int maxVal = candidates.Max(kv => kv.Value.Sum(GetRankValue));
         var bestSuits = candidates.Where(kv => kv.Value.Sum(GetRankValue) == maxVal).ToList();
         return HighestCard(bestSuits[0].Value);
     }
@@ -910,9 +777,11 @@ public class BotStrategy
         string r = code.Substring(0, code.Length - 1);
         switch (r)
         {
-            case "A": return 14; case "K": return 13;
-            case "Q": return 12; case "J": return 11;
-            default:  return int.TryParse(r, out int v) ? v : 0;
+            case "A": return 14;
+            case "K": return 13;
+            case "Q": return 12;
+            case "J": return 11;
+            default: return int.TryParse(r, out int v) ? v : 0;
         }
     }
 
@@ -937,9 +806,10 @@ public class BotStrategy
         foreach (string s in AllSuits)
         {
             int remaining = 13 - DiscardedCount(s);
-            int myCount   = hand.Count(c => GetSuit(c) == s);
+            int myCount = hand.Count(c => GetSuit(c) == s);
             if (myCount >= remaining - 1) dom.Add(s);
         }
+
         return dom;
     }
 
@@ -958,14 +828,16 @@ public class BotStrategy
     private bool PlayerHasGreaterCard(GameState gs, string pid, string refCard)
     {
         if (!gs.hands.ContainsKey(pid)) return false;
-        string suit = GetSuit(refCard); int rank = GetRankValue(refCard);
+        string suit = GetSuit(refCard);
+        int rank = GetRankValue(refCard);
         return gs.hands[pid].Any(c => GetSuit(c) == suit && GetRankValue(c) > rank);
     }
 
     private bool PlayerHasLowerCard(GameState gs, string pid, string refCard)
     {
         if (!gs.hands.ContainsKey(pid)) return false;
-        string suit = GetSuit(refCard); int rank = GetRankValue(refCard);
+        string suit = GetSuit(refCard);
+        int rank = GetRankValue(refCard);
         return gs.hands[pid].Any(c => GetSuit(c) == suit && GetRankValue(c) < rank);
     }
 

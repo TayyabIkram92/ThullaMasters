@@ -1,226 +1,174 @@
 using UnityEngine;
 using UnityEngine.UI;
-using UI;
+using TMPro;
 
 public class HomePageView : MonoBehaviour
 {
-    [Header("Profile Section")] [SerializeField]
-    private Button profileButton;
+    public const string ModeSelectKey = "HomePageModeSelect";
+    public const string ModeClassic = "Classic";
+    public const string ModeFriends = "Friends";
 
-    [SerializeField] private Image profileAvatarImage;
-    [SerializeField] private Text nameText;
-    [SerializeField] private Text playerIdText;
+    [Header("Coins")] [SerializeField] private Text coinsTxt;
 
-    [Header("Trophy Section")] [SerializeField]
-    private Slider trophySlider;
+    [Header("Profile")] [SerializeField] private Text displayNameTxt;
+    [SerializeField] private Text trophiesTxt;
+    [SerializeField] private Image avatarImage;
+    [SerializeField] private Sprite[] avatarSprites;
 
-    [SerializeField] private Text trophyProgressText; // ← NEW: shows "15/20"
+    [Header("Trophy Bar")] [SerializeField]
+    private Slider trophyProgressBar;
 
-    [Header("Coins Section")] [SerializeField]
-    private Text coinsText;
-
-    [SerializeField] private Button plusButton;
-    [SerializeField] private Button buyButton;
-    [SerializeField] private Button sellButton;
-
-    [Header("Game Mode Buttons")] [SerializeField]
-    private Button classicModeButton;
-
+    [Header("Buttons")] [SerializeField] private Button classicModeButton;
     [SerializeField] private Button playWithFriendsButton;
-    [SerializeField] private Button tutorialButton;
     [SerializeField] private Button friendsButton;
     [SerializeField] private Button settingsButton;
+    [SerializeField] private Button tutorialButton;
+    [SerializeField] private Button buyCoinsButton;
+    [SerializeField] private Button sellCoinsButton;
+    [SerializeField] private Button profileButton;
+    [SerializeField] private Button addButton;
 
-    [Header("Avatar Sprites (0-15)")] [SerializeField]
-    private Sprite[] avatarSprites = new Sprite[16]; 
-
-    // ── Unity ─────────────────────────────────────────────────────────────────
-
-    private void Awake()
-    {
-        if (profileButton != null)
-            profileButton.onClick.AddListener(OnProfileClicked);
-        if (plusButton != null)
-            plusButton.onClick.AddListener(PlusButtonClicked);
-        if (buyButton != null)
-            buyButton.onClick.AddListener(BuyButtonClicked);
-        if (sellButton != null)
-            sellButton.onClick.AddListener(SellButtonClicked);
-        if (classicModeButton != null)
-            classicModeButton.onClick.AddListener(OnClassicModeClicked);
-        if (playWithFriendsButton != null)
-            playWithFriendsButton.onClick.AddListener(PlayWithFriendsButtonClicked);
-        if (tutorialButton != null)
-            tutorialButton.onClick.AddListener(TutorialButtonClicked);
-        if (friendsButton != null)
-            friendsButton.onClick.AddListener(OnFriendsClicked);
-        if (settingsButton != null)
-            settingsButton.onClick.AddListener(SettingsbuttonClicked);
-    }
-
-    private void PlayWithFriendsButtonClicked()
-    {
-        
-    }
-
-    private void SellButtonClicked()
-    {
-        EventManager.FireShowView(ViewType.Sell,true);
-    }
-
-    private void BuyButtonClicked()
-    {
-        EventManager.FireShowView(ViewType.Buy,true);
-    }
-
-    private void PlusButtonClicked()
-    {
-        EventManager.FireShowView(ViewType.Buy,true);
-    }
-
-    private void SettingsbuttonClicked()
-    {
-        EventManager.FireShowView(ViewType.Settings, showAsDialogue: true);
-    }
-
-    private void TutorialButtonClicked()
-    {
-        EventManager.FireShowView(ViewType.Tutorial, true);
-    }
+    private bool _pendingGameSelection = false;
 
     private void OnEnable()
     {
+        classicModeButton.onClick.AddListener(OnClassicModeClicked);
+        playWithFriendsButton.onClick.AddListener(OnPlayWithFriendsClicked);
+        friendsButton.onClick.AddListener(OnFriendsClicked);
+        settingsButton.onClick.AddListener(OnSettingsClicked);
+        tutorialButton.onClick.AddListener(OnTutorialClicked);
+        profileButton.onClick.AddListener(ProfileButtonClicked);
+        addButton.onClick.AddListener(AddButtonClicked);
+        if (buyCoinsButton) buyCoinsButton.onClick.AddListener(OnBuyCoinsClicked);
+        if (sellCoinsButton) sellCoinsButton.onClick.AddListener(OnSellCoinsClicked);
+
+        EventManager.OnCoinsUpdated += HandleCoinsUpdated;
+        EventManager.OnGameModesFetched += HandleGameModesFetched;
+
         RefreshUI();
         CheckAndAwardTrophyReward();
         CheckFirstTimeProfile();
     }
 
-    private void OnDestroy()
+    private void OnDisable()
     {
-        if (profileButton != null) profileButton.onClick.RemoveAllListeners();
-        if (plusButton != null) plusButton.onClick.RemoveAllListeners();
-        if (buyButton != null) buyButton.onClick.RemoveAllListeners();
-        if (sellButton != null) sellButton.onClick.RemoveAllListeners();
-        if (classicModeButton != null) classicModeButton.onClick.RemoveAllListeners();
-        if (playWithFriendsButton != null) playWithFriendsButton.onClick.RemoveAllListeners();
-        if (tutorialButton != null) tutorialButton.onClick.RemoveAllListeners();
-        if (friendsButton != null) friendsButton.onClick.RemoveAllListeners();
-        if (settingsButton != null) settingsButton.onClick.RemoveAllListeners();
+        classicModeButton.onClick.RemoveListener(OnClassicModeClicked);
+        playWithFriendsButton.onClick.RemoveListener(OnPlayWithFriendsClicked);
+        friendsButton.onClick.RemoveListener(OnFriendsClicked);
+        settingsButton.onClick.RemoveListener(OnSettingsClicked);
+        tutorialButton.onClick.RemoveListener(OnTutorialClicked);
+        profileButton.onClick.AddListener(ProfileButtonClicked);
+        addButton.onClick.AddListener(AddButtonClicked);
+        if (buyCoinsButton) buyCoinsButton.onClick.RemoveListener(OnBuyCoinsClicked);
+        if (sellCoinsButton) sellCoinsButton.onClick.RemoveListener(OnSellCoinsClicked);
 
-        EventManager.OnGameModesFetched -= NavigateToGameSelection;
-        EventManager.OnFriendsFetched -= NavigateToFriends;
+        EventManager.OnCoinsUpdated -= HandleCoinsUpdated;
+        EventManager.OnGameModesFetched -= HandleGameModesFetched;
+
+        _pendingGameSelection = false;
+    }
+
+    private void AddButtonClicked()
+    {
+        EventManager.FireShowView(ViewType.Buy, true);
+    }
+
+    private void ProfileButtonClicked()
+    {
+        EventManager.FireShowView(ViewType.Profile, true);
+    }
+
+    public void RefreshUI()
+    {
+        if (!PlayerDataManager.IsInitialized) return;
+
+        displayNameTxt.text = PlayerDataManager.DisplayName;
+        trophiesTxt.text = PlayerDataManager.Trophies.ToString();
+
+        if (avatarImage != null && avatarSprites != null &&
+            PlayerDataManager.AvatarIndex < avatarSprites.Length)
+            avatarImage.sprite = avatarSprites[PlayerDataManager.AvatarIndex];
+
+        if (trophyProgressBar != null)
+            trophyProgressBar.value = PlayerDataManager.GetTrophyProgress() / 20f;
+    }
+
+    private void HandleCoinsUpdated(int newAmount)
+    {
+        coinsTxt.text = newAmount.ToString();
+    }
+
+    private void HandleGameModesFetched()
+    {
+        if (_pendingGameSelection)
+        {
+            _pendingGameSelection = false;
+            EventManager.FireShowView(ViewType.GameSelection);
+        }
+    }
+
+    private void CheckAndAwardTrophyReward()
+    {
+        if (PlayerDataManager.HasUnrewardedMilestone())
+            EventManager.FireAwardTrophyRewardRequested();
+    }
+
+    private void CheckFirstTimeProfile()
+    {
+        if (!PlayerDataManager.HasSetupProfile)
+            EventManager.FireShowView(ViewType.Profile, true);
+    }
+
+    private void OnClassicModeClicked()
+    {
+        PlayerPrefs.SetString(ModeSelectKey, ModeClassic);
+        PlayerPrefs.Save();
+        NavigateToGameSelection();
+    }
+
+    private void OnPlayWithFriendsClicked()
+    {
+        PlayerPrefs.SetString(ModeSelectKey, ModeFriends);
+        PlayerPrefs.Save();
+        NavigateToGameSelection();
+    }
+
+    private void NavigateToGameSelection()
+    {
+        if (!GameModeManager.IsInitialized)
+        {
+            _pendingGameSelection = true;
+            EventManager.FireFetchGameModesRequested();
+            return;
+        }
+
+        EventManager.FireShowView(ViewType.GameSelection);
     }
 
     private void OnFriendsClicked()
     {
         if (!FriendsManager.IsInitialized)
-        {
             EventManager.FireFetchFriendsRequested();
-            EventManager.OnFriendsFetched += NavigateToFriends;
-        }
-        else
-        {
-            NavigateToFriends();
-        }
+        EventManager.FireShowView(ViewType.Friends, true);
     }
 
-    private void NavigateToFriends()
+    private void OnSettingsClicked()
     {
-        EventManager.OnFriendsFetched -= NavigateToFriends;
-        EventManager.FireShowView(ViewType.Friends, showAsDialogue: true);
-    }
-    // ── UI Refresh ────────────────────────────────────────────────────────────
-
-    public void RefreshUI()
-    {
-        // Name
-        if (nameText != null)
-            nameText.text = PlayerDataManager.DisplayName;
-
-        if (playerIdText != null)
-            playerIdText.text = PlayerDataManager.DisplayName;
-        // Avatar
-        if (profileAvatarImage != null &&
-            PlayerDataManager.AvatarIndex >= 0 &&
-            PlayerDataManager.AvatarIndex < avatarSprites.Length &&
-            avatarSprites[PlayerDataManager.AvatarIndex] != null)
-        {
-            profileAvatarImage.sprite = avatarSprites[PlayerDataManager.AvatarIndex];
-        }
-
-        // Coins
-        if (coinsText != null)
-            coinsText.text = PlayerDataManager.Coins.ToString();
-
-        // Trophy slider + progress text
-        if (trophySlider != null)
-        {
-            int progress = PlayerDataManager.GetTrophyProgress();
-            trophySlider.maxValue = 20;
-            trophySlider.value = progress;
-        }
-
-        if (trophyProgressText != null)
-        {
-            int progress = PlayerDataManager.GetTrophyProgress();
-            trophyProgressText.text = $"{progress}/20";
-        }
+        EventManager.FireShowView(ViewType.Settings, true);
     }
 
-    // ── Trophy Reward Logic (FIXED) ───────────────────────────────────────────
-
-    private void CheckAndAwardTrophyReward()
+    private void OnTutorialClicked()
     {
-        // Only award if there's an unrewarded milestone
-        if (PlayerDataManager.HasUnrewardedMilestone())
-        {
-            int currentMilestone = PlayerDataManager.GetCurrentMilestone();
-            Debug.Log(
-                $"[HomePageView] Awarding reward for milestone {currentMilestone}. Trophies: {PlayerDataManager.Trophies}");
-
-            EventManager.FireAwardTrophyRewardRequested();
-        }
+        EventManager.FireShowView(ViewType.Tutorial, true);
     }
 
-    // ── First-Time Profile ────────────────────────────────────────────────────
-
-    private void CheckFirstTimeProfile()
+    private void OnBuyCoinsClicked()
     {
-        if (!PlayerDataManager.HasSetupProfile)
-        {
-            Debug.Log("[HomePageView] First-time user. Showing ProfileView.");
-            EventManager.FireShowView(ViewType.Profile, showAsDialogue: true);
-        }
+        EventManager.FireShowView(ViewType.Buy, true);
     }
 
-    // ── Button Callbacks ──────────────────────────────────────────────────────
-
-    private void OnProfileClicked()
+    private void OnSellCoinsClicked()
     {
-        EventManager.FireShowView(ViewType.Profile, showAsDialogue: true);
-    }
-
-    private void OnClassicModeClicked()
-    {
-        // Fetch game modes if not already cached
-        if (!GameModeManager.IsInitialized)
-        {
-            EventManager.FireFetchGameModesRequested();
-            // Subscribe to wait for fetch completion
-            EventManager.OnGameModesFetched += NavigateToGameSelection;
-        }
-        else
-        {
-            NavigateToGameSelection();
-        }
-    }
-
-    private void NavigateToGameSelection()
-    {
-        // Unsubscribe
-        EventManager.OnGameModesFetched -= NavigateToGameSelection;
-
-        // Navigate
-        EventManager.FireShowView(ViewType.GameSelection);
+        EventManager.FireShowView(ViewType.Sell, true);
     }
 }

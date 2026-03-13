@@ -1,57 +1,56 @@
-using UI;
 using UnityEngine;
 using UnityEngine.UI;
+using TMPro;
 
+/// <summary>
+/// Represents a single friend in FriendsView.
+/// Poolable — call Setup() to reuse.
+/// trophiesTxt shows the friend's position number (1, 2, 3...) not their trophies.
+/// </summary>
 public class FriendCard : MonoBehaviour
 {
-    [Header("UI References")] [SerializeField]
-    private Image avatarImage;
-
-    [SerializeField] private Text nameTxt;
-    [SerializeField] private Text trophiesTxt;
-    [SerializeField] private Button deleteBtn;
-
-    [Header("Avatar Sprites (0-15)")] [SerializeField]
-    private Sprite[] avatarSprites = new Sprite[16];
+    [SerializeField] private Image avatarImage;
+    [SerializeField] private Text displayNameTxt;
+    [SerializeField] private Text trophiesTxt;   // shows friend number
+    [SerializeField] private Button deleteButton;
+    [SerializeField] private Sprite[] avatarSprites;
 
     private FriendData _friendData;
+    private System.Action<FriendData> _onDeleteClicked;
 
-    private void Awake()
+    private void OnEnable()
     {
-        if (deleteBtn != null)
-            deleteBtn.onClick.AddListener(OnDeleteClicked);
+        deleteButton.onClick.AddListener(OnDeleteClicked);
     }
 
-    private void OnDestroy()
+    private void OnDisable()
     {
-        if (deleteBtn != null)
-            deleteBtn.onClick.RemoveAllListeners();
+        deleteButton.onClick.RemoveListener(OnDeleteClicked);
     }
 
-    public void Initialize(FriendData friendData)
+    /// <summary>
+    /// Setup this card for a friend.
+    /// </summary>
+    /// <param name="data">Friend data</param>
+    /// <param name="friendNumber">1-based position number shown in trophiesTxt</param>
+    /// <param name="onDelete">Callback when delete is pressed</param>
+    public void Setup(FriendData data, int friendNumber, System.Action<FriendData> onDelete)
     {
-        _friendData = friendData;
+        _friendData = data;
+        _onDeleteClicked = onDelete;
 
-        if (nameTxt != null)
-            nameTxt.text = friendData.DisplayName;
+        displayNameTxt.text = data.DisplayName;
+        trophiesTxt.text = friendNumber.ToString();
 
-        if (trophiesTxt != null)
-            trophiesTxt.text = friendData.Trophies.ToString();
-
-        if (avatarImage != null &&
-            friendData.AvatarIndex >= 0 &&
-            friendData.AvatarIndex < avatarSprites.Length &&
-            avatarSprites[friendData.AvatarIndex] != null)
-        {
-            avatarImage.sprite = avatarSprites[friendData.AvatarIndex];
-        }
+        if (avatarImage != null && avatarSprites != null &&
+            data.AvatarIndex >= 0 && data.AvatarIndex < avatarSprites.Length)
+            avatarImage.sprite = avatarSprites[data.AvatarIndex];
     }
 
     private void OnDeleteClicked()
     {
-        PlayerPrefs.SetString("PendingDeleteFriendId", _friendData.PlayFabId);
-        PlayerPrefs.SetString("PendingDeleteFriendName", _friendData.DisplayName);
-
-        EventManager.FireShowView(ViewType.DeleteFriend, showAsDialogue: true);
+        _onDeleteClicked?.Invoke(_friendData);
     }
+
+    public FriendData GetFriendData() => _friendData;
 }

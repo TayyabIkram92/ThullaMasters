@@ -1,110 +1,85 @@
 using System;
 using System.Collections.Generic;
 
-/// <summary>
-/// EventManager partial — all InGame gameplay events.
-/// Matches exactly what GameManager.cs and InGameView.cs use.
-/// </summary>
 public static partial class EventManager
 {
-    // ── Game State ────────────────────────────────────────────────────────────
+    // ─── Game Ready ───────────────────────────────────────────────────────────
+    public static event Action<List<CardData>, List<SlotData>> OnGameReady;
+    public static void FireGameReady(List<CardData> hand, List<SlotData> players)
+        => OnGameReady?.Invoke(hand, players);
 
-    /// <summary>Fired whenever GameState changes (from Firestore or host logic).</summary>
+    // ─── Game State ──────────────────────────────────────────────────────────
     public static event Action<GameState> OnGameStateUpdated;
-    public static void FireGameStateUpdated(GameState gs)
-        => OnGameStateUpdated?.Invoke(gs);
+    public static void FireGameStateUpdated(GameState state)
+        => OnGameStateUpdated?.Invoke(state);
 
-    /// <summary>Fired when it becomes the local player's turn.</summary>
-    public static event Action<GameState> OnMyTurnStarted;
-    public static void FireMyTurnStarted(GameState gs)
-        => OnMyTurnStarted?.Invoke(gs);
-
-    /// <summary>Fired by InGameView when local player taps a card.</summary>
-    public static event Action<string> OnLocalCardPlayed;   // cardCode e.g. "AS"
+    // ─── Turn ────────────────────────────────────────────────────────────────
+    public static event Action<string> OnLocalCardPlayed;
     public static void FireLocalCardPlayed(string cardCode)
         => OnLocalCardPlayed?.Invoke(cardCode);
 
-    /// <summary>Fired by InGameView when local player taps a flipped card in shootout.</summary>
-    public static event Action OnShootoutCardChosen;
-    public static void FireShootoutCardChosen()
-        => OnShootoutCardChosen?.Invoke();
+    public static event Action<string, string> OnCardPlayed;
+    public static void FireCardPlayed(string playerId, string cardCode)
+        => OnCardPlayed?.Invoke(playerId, cardCode);
 
-    /// <summary>Fired when any player plays a card. UI shows it on the table.</summary>
-    public static event Action<string, string> OnCardPlayed;  // (playerId, cardCode)
-    public static void FireCardPlayed(string pid, string card)
-        => OnCardPlayed?.Invoke(pid, card);
+    public static event Action<string> OnPlayerTurnStarted;
+    public static void FirePlayerTurnStarted(string playerId)
+        => OnPlayerTurnStarted?.Invoke(playerId);
 
-    /// <summary>Fired when a round is discarded. nextLeadPlayerId leads next round.</summary>
-    public static event Action<string> OnRoundDiscarded;
-    public static void FireRoundDiscarded(string nextLeadPlayerId)
-        => OnRoundDiscarded?.Invoke(nextLeadPlayerId);
+    public static event Action<float> OnTurnTimerUpdated;
+    public static void FireTurnTimerUpdated(float secondsRemaining)
+        => OnTurnTimerUpdated?.Invoke(secondsRemaining);
 
-    /// <summary>Fired when a player picks up cards after an out-of-suit play.</summary>
-    public static event Action<string, List<string>> OnCardsPickedUp; // (playerId, cards)
-    public static void FireCardsPickedUp(string pid, List<string> cards)
-        => OnCardsPickedUp?.Invoke(pid, cards);
-
-    /// <summary>Fired when a player runs out of cards and wins.</summary>
-    public static event Action<string> OnPlayerWon;
-    public static void FirePlayerWon(string pid)
-        => OnPlayerWon?.Invoke(pid);
-
-    /// <summary>
-    /// Fired when the game is finished.
-    /// winners = ordered list of winner playerIds, bhabhi = loser playerId.
-    /// Matches GameManager: FireGameFinished(_gs.winners, _gs.bhabhi)
-    /// </summary>
-    public static event Action<List<string>, string> OnGameFinished; // (winners, bhabhiId)
-    public static void FireGameFinished(List<string> winners, string bhabhi)
-        => OnGameFinished?.Invoke(winners, bhabhi);
-
-    /// <summary>Fired by InGameView steal button. GameManager handles the logic.</summary>
-    public static event Action OnStealHandRequested;
-    public static void FireStealHandRequested()
-        => OnStealHandRequested?.Invoke();
-
-    /// <summary>
-    /// Fired when shootout starts. int = number of cards in responder's hand
-    /// (so InGameView knows how many FlippedCard prefabs to spawn).
-    /// </summary>
-    public static event Action<int> OnShootoutStarted;
-    public static void FireShootoutStarted(int responderCardCount)
-        => OnShootoutStarted?.Invoke(responderCardCount);
-
-    /// <summary>Fired when local player taps a flipped card. int = index tapped.</summary>
-    public static event Action<int> OnFlippedCardPicked;
-    public static void FireFlippedCardPicked(int index)
-        => OnFlippedCardPicked?.Invoke(index);
-
-    // ── Timer ─────────────────────────────────────────────────────────────────
-
-    /// <summary>
-    /// Fired every frame during a turn.
-    /// fill = 0..1 (1=full time, 0=expired).
-    /// pid  = whose turn it is (used to update the correct profile timer image).
-    /// </summary>
-    public static event Action<float, string> OnTimerTick;
-    public static void FireTimerTick(float fill, string pid)
-        => OnTimerTick?.Invoke(fill, pid);
-
-    // ── Coins ─────────────────────────────────────────────────────────────────
-
-    /// <summary>
-    /// Fired by host at game end to award coins to winners.
-    /// PlayFabManager listens and calls AddUserVirtualCurrency for each winner.
-    /// </summary>
-    public static event Action<List<string>, int> OnAwardGameCoinsRequested; // (winnerIds, amount)
-    public static void FireAwardGameCoinsRequested(List<string> winnerIds, int amount)
-        => OnAwardGameCoinsRequested?.Invoke(winnerIds, amount);
-
-    // ── Hand Updates ──────────────────────────────────────────────────────────
-
-    /// <summary>
-    /// Fired whenever the local player's hand changes (card played, pickup, steal, shootout).
-    /// Carries both the new hand AND the latest GameState so InGameView can update
-    /// _gs before calling RefreshCardInteractability — avoiding stale state bugs.
-    /// </summary>
+    // ─── Hand ────────────────────────────────────────────────────────────────
+    // 2-param version — matches GameManager: FireLocalHandUpdated(List<string>, GameState)
+    // The list carries raw short-code strings; views convert to CardData themselves.
     public static event Action<List<string>, GameState> OnLocalHandUpdated;
     public static void FireLocalHandUpdated(List<string> hand, GameState gs)
         => OnLocalHandUpdated?.Invoke(hand, gs);
+
+    public static event Action<string, int> OnPlayerHandCountUpdated;
+    public static void FirePlayerHandCountUpdated(string playerId, int count)
+        => OnPlayerHandCountUpdated?.Invoke(playerId, count);
+
+    // ─── Steal ───────────────────────────────────────────────────────────────
+    // Used by GameManager: EventManager.OnStealHandRequested += HandleStealHand
+    public static event Action OnStealHandRequested;
+    public static void FireStealHandRequested() => OnStealHandRequested?.Invoke();
+
+    // ─── Leave Game (in-game only — distinct from LeaveRoom matchmaking event) ─
+    // Used by GameManager, HostWatchdog, InGameManager
+    public static event Action OnLeaveGameRequested;
+    public static void FireLeaveGameRequested() => OnLeaveGameRequested?.Invoke();
+
+    // ─── Shootout ────────────────────────────────────────────────────────────
+    public static event Action<string> OnShootoutStarted;
+    public static void FireShootoutStarted(string drawerId)
+        => OnShootoutStarted?.Invoke(drawerId);
+
+    public static event Action<CardData> OnShootoutCardDrawn;
+    public static void FireShootoutCardDrawn(CardData card)
+        => OnShootoutCardDrawn?.Invoke(card);
+
+    // ─── Round ───────────────────────────────────────────────────────────────
+    public static event Action OnRoundResolved;
+    public static void FireRoundResolved() => OnRoundResolved?.Invoke();
+
+    public static event Action<string> OnThulaResolved;
+    public static void FireThulaResolved(string pickupPlayerId)
+        => OnThulaResolved?.Invoke(pickupPlayerId);
+
+    // ─── Game End ────────────────────────────────────────────────────────────
+    public static event Action<List<string>, string> OnGameFinished;
+    public static void FireGameFinished(List<string> winners, string bhabhi)
+        => OnGameFinished?.Invoke(winners, bhabhi);
+
+    // ─── Coins Award (host only) ─────────────────────────────────────────────
+    public static event Action<List<string>, int> OnAwardGameCoinsRequested;
+    public static void FireAwardGameCoinsRequested(List<string> winnerIds, int amount)
+        => OnAwardGameCoinsRequested?.Invoke(winnerIds, amount);
+
+    // ─── Card Deal Animation Sync ─────────────────────────────────────────────
+    public static event Action OnCardDealAnimationComplete;
+    public static void FireCardDealAnimationComplete()
+        => OnCardDealAnimationComplete?.Invoke();
 }

@@ -1,14 +1,23 @@
+using System;
+using System.Collections;
+using System.Collections.Generic;
 using UnityEngine;
 using PlayFab;
 using PlayFab.ClientModels;
-using System.Collections;
-using System.Collections.Generic;
 
+/// <summary>
+/// Single class handling ALL PlayFab API calls.
+/// No Newtonsoft — uses JsonUtility.
+/// Coins are read/written directly from PlayFab. No local coin cache.
+/// </summary>
 public class PlayFabManager : MonoBehaviour
 {
     private const string GuestIdKey = "GuestCustomID";
-
-    // ── Unity ─────────────────────────────────────────────────────────────────
+    private const string SavedEmailKey = "SavedEmail";
+    private const string SavedPasswordKey = "SavedPassword";
+    private const string PlayerStatsKey = "PlayerStats";
+    private const string TitleConfigKey = "AppConfig";
+    private const string CoinCurrencyCode = "CO";
 
     private void OnEnable()
     {
@@ -16,14 +25,23 @@ public class PlayFabManager : MonoBehaviour
         EventManager.OnLoginRequested += HandleLogin;
         EventManager.OnRegisterAndLoginRequested += HandleRegisterAndLogin;
         EventManager.OnGuestLoginRequested += HandleGuestLogin;
+        EventManager.OnLogoutRequested += HandleLogout;
+
         EventManager.OnUpdateProfileRequested += HandleUpdateProfile;
-        EventManager.OnAwardTrophyRewardRequested += HandleAwardTrophyReward;
+        EventManager.OnCheckUsernameAvailability += HandleCheckUsername;
+
+        EventManager.OnFetchCoinsRequested += HandleFetchCoins;
+        EventManager.OnAddCoinsRequested += HandleAddCoins;
         EventManager.OnDeductCoinsRequested += HandleDeductCoins;
-        EventManager.OnFetchGameModesRequested += HandleFetchGameModes;
-        EventManager.OnCheckUsernameAvailability += HandleCheckUsernameAvailability;
+        EventManager.OnAwardTrophyRewardRequested += HandleAwardTrophyReward;
+
+        EventManager.OnFetchGameModesRequested += HandleFetchTitleData;
+        EventManager.OnFetchTitleDataRequested += HandleFetchTitleData;
+
         EventManager.OnFetchFriendsRequested += HandleFetchFriends;
         EventManager.OnAddFriendRequested += HandleAddFriend;
         EventManager.OnRemoveFriendRequested += HandleRemoveFriend;
+        EventManager.OnGetCoinsRequested += HandleGetCoins;
     }
 
     private void OnDisable()
@@ -32,591 +50,508 @@ public class PlayFabManager : MonoBehaviour
         EventManager.OnLoginRequested -= HandleLogin;
         EventManager.OnRegisterAndLoginRequested -= HandleRegisterAndLogin;
         EventManager.OnGuestLoginRequested -= HandleGuestLogin;
+        EventManager.OnLogoutRequested -= HandleLogout;
+
         EventManager.OnUpdateProfileRequested -= HandleUpdateProfile;
-        EventManager.OnAwardTrophyRewardRequested -= HandleAwardTrophyReward;
+        EventManager.OnCheckUsernameAvailability -= HandleCheckUsername;
+
+        EventManager.OnFetchCoinsRequested -= HandleFetchCoins;
+        EventManager.OnAddCoinsRequested -= HandleAddCoins;
         EventManager.OnDeductCoinsRequested -= HandleDeductCoins;
-        EventManager.OnFetchGameModesRequested -= HandleFetchGameModes;
-        EventManager.OnCheckUsernameAvailability -= HandleCheckUsernameAvailability;
+        EventManager.OnAwardTrophyRewardRequested -= HandleAwardTrophyReward;
+
+        EventManager.OnFetchGameModesRequested -= HandleFetchTitleData;
+        EventManager.OnFetchTitleDataRequested -= HandleFetchTitleData;
+
         EventManager.OnFetchFriendsRequested -= HandleFetchFriends;
         EventManager.OnAddFriendRequested -= HandleAddFriend;
         EventManager.OnRemoveFriendRequested -= HandleRemoveFriend;
+        EventManager.OnGetCoinsRequested -= HandleGetCoins;
     }
 
-    // ── Auto Login ────────────────────────────────────────────────────────────
+    private void HandleGetCoins(Action<int> callback)
+    {
+        PlayFabClientAPI.GetUserInventory(
+            new GetUserInventoryRequest(),
+            result =>
+            {
+                int coins = 0;
+                if (result.VirtualCurrency != null &&
+                    result.VirtualCurrency.TryGetValue(CoinCurrencyCode, out int c))
+                    coins = c;
+                CoinsUIManager.UpdateCoins(coins);
+                callback?.Invoke(coins);
+            },
+            err =>
+            {
+                Debug.LogWarning("[PlayFab] GetCoins failed: " + err.ErrorMessage);
+                callback?.Invoke(0);
+            });
+    }
+    // ══════════════════════════════════════════════════════════════════════════
+    // AUTH
+    // ══════════════════════════════════════════════════════════════════════════
 
     private void HandleAutoLogin()
     {
-        if (PlayerPrefs.HasKey(GuestIdKey))
+        // Try saved email credentials first
+        string savedEmail = PlayerPrefs.GetString(SavedEmailKey, string.Empty);
+        string savedPassword = PlayerPrefs.GetString(SavedPasswordKey, string.Empty);
+
+        if (!string.IsNullOrEmpty(savedEmail) && !string.IsNullOrEmpty(savedPassword))
         {
-            PlayFabClientAPI.LoginWithCustomID(
-                new LoginWithCustomIDRequest
-                {
-                    CustomId = PlayerPrefs.GetString(GuestIdKey),
-                    CreateAccount = false,
-                    InfoRequestParameters = new GetPlayerCombinedInfoRequestParams
-                    {
-                        GetUserAccountInfo = true,
-                        GetPlayerProfile = true,
-                        GetUserVirtualCurrency = true,
-                        GetUserData = true
-                    }
-                },
-                result =>
-                {
-                    Debug.Log("[PlayFabManager] Auto-login success.");
-                    StartCoroutine(ParseAndCachePlayerDataDelayed(result.InfoResultPayload, true));
-                },
+            PlayFabClientAPI.LoginWithEmailAddress(
+                new LoginWithEmailAddressRequest { Email = savedEmail, Password = savedPassword },
+                result => StartCoroutine(FetchPlayerDataAfterLogin(result.PlayFabId)),
                 error =>
                 {
-                    Debug.Log($"[PlayFabManager] Auto-login failed: {error.ErrorMessage}");
+                    // Saved credentials invalid — clear them and fall back to login screen
+                    PlayerPrefs.DeleteKey(SavedEmailKey);
+                    PlayerPrefs.DeleteKey(SavedPasswordKey);
+                    PlayerPrefs.Save();
                     EventManager.FireAutoLoginChecked(false);
+                    EventManager.FireShowView(ViewType.SignUpLogin);
                 });
+            return;
         }
-        else
+
+        // Fall back to guest auto-login
+        string customId = PlayerPrefs.GetString(GuestIdKey, string.Empty);
+        if (string.IsNullOrEmpty(customId))
         {
             EventManager.FireAutoLoginChecked(false);
+            EventManager.FireShowView(ViewType.SignUpLogin);
+            return;
         }
-    }
 
-    // ── Login ─────────────────────────────────────────────────────────────────
+        PlayFabClientAPI.LoginWithCustomID(
+            new LoginWithCustomIDRequest { CustomId = customId, CreateAccount = false },
+            result => StartCoroutine(FetchPlayerDataAfterLogin(result.PlayFabId)),
+            error =>
+            {
+                EventManager.FireAutoLoginChecked(false);
+                EventManager.FireShowView(ViewType.SignUpLogin);
+            });
+    }
 
     private void HandleLogin(string email, string password)
     {
         PlayFabClientAPI.LoginWithEmailAddress(
-            new LoginWithEmailAddressRequest
-            {
-                Email = email,
-                Password = password,
-                InfoRequestParameters = new GetPlayerCombinedInfoRequestParams
-                {
-                    GetUserAccountInfo = true,
-                    GetPlayerProfile = true,
-                    GetUserVirtualCurrency = true,
-                    GetUserData = true
-                }
-            },
+            new LoginWithEmailAddressRequest { Email = email, Password = password },
             result =>
             {
-                Debug.Log("[PlayFabManager] Login success.");
-                StartCoroutine(ParseAndCachePlayerDataDelayed(result.InfoResultPayload, false));
+                PlayerPrefs.SetString(SavedEmailKey, email);
+                PlayerPrefs.SetString(SavedPasswordKey, password);
+                PlayerPrefs.Save();
+                StartCoroutine(FetchPlayerDataAfterLogin(result.PlayFabId));
             },
-            error =>
-            {
-                if (error.Error == PlayFabErrorCode.AccountNotFound ||
-                    error.Error == PlayFabErrorCode.InvalidEmailOrPassword)
-                {
-                    EventManager.FireAuthConflict(triedLogin: true);
-                }
-                else
-                {
-                    Debug.LogError($"[PlayFabManager] Login error: {error.GenerateErrorReport()}");
-                }
-            });
+            error => { EventManager.FireAuthConflict(true); });
     }
-
-    // ── Register & Login ──────────────────────────────────────────────────────
 
     private void HandleRegisterAndLogin(string email, string password)
     {
+        string username = email.Contains("@") ? email.Split('@')[0] : email;
+
         PlayFabClientAPI.RegisterPlayFabUser(
             new RegisterPlayFabUserRequest
             {
                 Email = email,
                 Password = password,
-                RequireBothUsernameAndEmail = false
+                Username = username,
+                DisplayName = username
             },
-            _ =>
-            {
-                Debug.Log("[PlayFabManager] Registration success. Logging in...");
-                LoginAfterRegister(email, password);
-            },
-            error =>
-            {
-                if (error.Error == PlayFabErrorCode.EmailAddressNotAvailable)
-                {
-                    EventManager.FireAuthConflict(triedLogin: false);
-                }
-                else
-                {
-                    Debug.LogError($"[PlayFabManager] Register error: {error.GenerateErrorReport()}");
-                }
-            });
+            result => HandleLogin(email, password),
+            error => { EventManager.FireAuthConflict(false); });
     }
-
-    private void LoginAfterRegister(string email, string password)
-    {
-        PlayFabClientAPI.LoginWithEmailAddress(
-            new LoginWithEmailAddressRequest
-            {
-                Email = email,
-                Password = password,
-                InfoRequestParameters = new GetPlayerCombinedInfoRequestParams
-                {
-                    GetUserAccountInfo = true,
-                    GetPlayerProfile = true,
-                    GetUserVirtualCurrency = true,
-                    GetUserData = true
-                }
-            },
-            result =>
-            {
-                Debug.Log("[PlayFabManager] Post-register login success.");
-                StartCoroutine(ParseAndCachePlayerDataDelayed(result.InfoResultPayload, false));
-            },
-            error => { Debug.LogError($"[PlayFabManager] Post-register login error: {error.GenerateErrorReport()}"); });
-    }
-
-    // ── Guest Login ───────────────────────────────────────────────────────────
 
     private void HandleGuestLogin()
     {
-        if (!PlayerPrefs.HasKey(GuestIdKey))
-            PlayerPrefs.SetString(GuestIdKey, System.Guid.NewGuid().ToString());
+        string customId = PlayerPrefs.GetString(GuestIdKey, string.Empty);
+        if (string.IsNullOrEmpty(customId))
+        {
+            customId = Guid.NewGuid().ToString();
+            PlayerPrefs.SetString(GuestIdKey, customId);
+            PlayerPrefs.Save();
+        }
 
         PlayFabClientAPI.LoginWithCustomID(
-            new LoginWithCustomIDRequest
+            new LoginWithCustomIDRequest { CustomId = customId, CreateAccount = true },
+            result => StartCoroutine(FetchPlayerDataAfterLogin(result.PlayFabId)),
+            error => EventManager.FireShowPopUp("Guest login failed: " + error.ErrorMessage));
+    }
+
+    private void HandleLogout()
+    {
+        PlayFabClientAPI.ForgetAllCredentials();
+        PlayerPrefs.DeleteKey(SavedEmailKey);
+        PlayerPrefs.DeleteKey(SavedPasswordKey);
+        PlayerPrefs.Save();
+        PlayerDataManager.Clear();
+        GameModeManager.Clear();
+        FriendsManager.Clear();
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // PLAYER DATA
+    // ══════════════════════════════════════════════════════════════════════════
+
+    private IEnumerator FetchPlayerDataAfterLogin(string playFabId)
+    {
+        yield return null; // one frame
+
+        PlayFabClientAPI.GetPlayerCombinedInfo(
+            new GetPlayerCombinedInfoRequest
             {
-                CustomId = PlayerPrefs.GetString(GuestIdKey),
-                CreateAccount = true,
                 InfoRequestParameters = new GetPlayerCombinedInfoRequestParams
                 {
                     GetUserAccountInfo = true,
-                    GetPlayerProfile = true,
                     GetUserVirtualCurrency = true,
                     GetUserData = true
                 }
             },
             result =>
             {
-                Debug.Log("[PlayFabManager] Guest login success.");
-                StartCoroutine(ParseAndCachePlayerDataDelayed(result.InfoResultPayload, false));
+                string displayName = result.InfoResultPayload?.AccountInfo?.TitleInfo?.DisplayName ?? "Player";
+
+                int coins = 0;
+                if (result.InfoResultPayload?.UserVirtualCurrency != null &&
+                    result.InfoResultPayload.UserVirtualCurrency.TryGetValue(CoinCurrencyCode, out int c))
+                    coins = c;
+
+                PlayerStatsData stats = new PlayerStatsData();
+                if (result.InfoResultPayload?.UserData != null &&
+                    result.InfoResultPayload.UserData.TryGetValue(PlayerStatsKey, out var entry))
+                {
+                    try
+                    {
+                        stats = JsonUtility.FromJson<PlayerStatsData>(entry.Value) ?? new PlayerStatsData();
+                    }
+                    catch
+                    {
+                        stats = new PlayerStatsData();
+                    }
+                }
+
+                PlayerDataManager.Initialize(playFabId, displayName, stats);
+                CoinsUIManager.UpdateCoins(coins);
+                HandleFetchTitleData();
+
+                EventManager.FireAuthSuccess();
+                EventManager.FirePlayerDataLoaded();
+                EventManager.FireAutoLoginChecked(true);
+
+                if (!PlayerDataManager.HasSetupProfile)
+                    EventManager.FireShowView(ViewType.Profile, true);
+                else
+                    EventManager.FireShowView(ViewType.Home);
+
+                if (PlayerDataManager.HasUnrewardedMilestone())
+                    EventManager.FireAwardTrophyRewardRequested();
             },
-            error => { Debug.LogError($"[PlayFabManager] Guest login error: {error.GenerateErrorReport()}"); });
+            error =>
+            {
+                EventManager.FireAutoLoginChecked(false);
+                EventManager.FireShowPopUp("Failed to load player data: " + error.ErrorMessage);
+                EventManager.FireShowView(ViewType.SignUpLogin);
+            });
     }
 
-    private void HandleAwardGameWinCoins(int amount)
-    {
-        PlayFabClientAPI.AddUserVirtualCurrency(
-            new PlayFab.ClientModels.AddUserVirtualCurrencyRequest
-            {
-                VirtualCurrency = "CO",
-                Amount = amount
-            },
-            result =>
-            {
-                PlayerDataManager.UpdateCoins(result.Balance);
-                Debug.Log($"[PlayFabManager] Game win coins awarded: +{amount}. New balance: {result.Balance}");
-            },
-            error => { Debug.LogError($"[PlayFabManager] AwardGameWinCoins error: {error.GenerateErrorReport()}"); });
-    }
-    // ── Parse PlayFab Data ────────────────────────────────────────────────────
+    // ══════════════════════════════════════════════════════════════════════════
+    // PROFILE
+    // ══════════════════════════════════════════════════════════════════════════
 
-    private IEnumerator ParseAndCachePlayerDataDelayed(GetPlayerCombinedInfoResultPayload payload, bool isAutoLogin)
-    {
-        yield return null;
-
-        string playfabId = payload?.AccountInfo?.PlayFabId ?? "";
-        string displayName = payload?.PlayerProfile?.DisplayName;
-
-        int coins = 0;
-        if (payload?.UserVirtualCurrency != null &&
-            payload.UserVirtualCurrency.ContainsKey("CO"))
-        {
-            coins = payload.UserVirtualCurrency["CO"];
-        }
-
-        PlayerStatsData statsData = new PlayerStatsData();
-
-        if (payload?.UserData != null &&
-            payload.UserData.ContainsKey("PlayerStats"))
-        {
-            try
-            {
-                string json = payload.UserData["PlayerStats"].Value;
-                statsData = JsonUtility.FromJson<PlayerStatsData>(json);
-            }
-            catch
-            {
-                Debug.LogWarning("[PlayFabManager] Failed to parse PlayerStats.");
-            }
-        }
-        else
-        {
-            Debug.Log("[PlayFabManager] No PlayerStats found. Saving defaults.");
-            SavePlayerStatsToPlayFab();
-        }
-
-        if (string.IsNullOrEmpty(displayName))
-        {
-            bool isGuest = PlayerPrefs.HasKey(GuestIdKey);
-            displayName = PlayerDataManager.GenerateRandomUsername(isGuest);
-        }
-
-        PlayerDataManager.Initialize(playfabId, displayName, coins, statsData);
-
-        if (isAutoLogin)
-        {
-            EventManager.FireAutoLoginChecked(true);
-        }
-
-        EventManager.FirePlayerDataLoaded();
-        Debug.Log($"[PlayFabManager] PlayFabId = '{playfabId}'");
-    }
-
-    // ── Update Profile ────────────────────────────────────────────────────────
-
-    private void HandleUpdateProfile(string displayName, int avatarIndex)
+    private void HandleUpdateProfile(string username, int avatarIndex)
     {
         PlayFabClientAPI.UpdateUserTitleDisplayName(
-            new UpdateUserTitleDisplayNameRequest { DisplayName = displayName },
-            _ => Debug.Log($"[PlayFabManager] DisplayName updated: {displayName}"),
-            error => Debug.LogError($"[PlayFabManager] UpdateDisplayName error: {error.GenerateErrorReport()}"));
-
-        PlayerDataManager.UpdateProfile(displayName, avatarIndex);
-        SavePlayerStatsToPlayFab();
+            new UpdateUserTitleDisplayNameRequest { DisplayName = username },
+            nameResult =>
+            {
+                PlayerDataManager.UpdateProfile(username, avatarIndex);
+                SavePlayerStats(() => EventManager.FireProfileUpdateSuccess());
+            },
+            error => EventManager.FireShowPopUp("Profile update failed: " + error.ErrorMessage));
     }
 
-    // ── Award Trophy Reward ───────────────────────────────────────────────────
-
-    private void HandleAwardTrophyReward()
+    private void HandleCheckUsername(string username, Action<bool> callback)
     {
-        int currentMilestone = PlayerDataManager.GetCurrentMilestone();
-
-        PlayFabClientAPI.AddUserVirtualCurrency(
-            new AddUserVirtualCurrencyRequest
-            {
-                VirtualCurrency = "CO",
-                Amount = 10
-            },
+        PlayFabClientAPI.GetAccountInfo(
+            new GetAccountInfoRequest { TitleDisplayName = username },
             result =>
             {
-                PlayerDataManager.UpdateCoins(result.Balance);
-                Debug.Log(
-                    $"[PlayFabManager] Trophy reward granted for milestone {currentMilestone}. New balance: {result.Balance}");
-
-                PlayerDataManager.UpdateLastRewardedMilestone(currentMilestone);
-                SavePlayerStatsToPlayFab();
-
-                var homePage = UnityEngine.Object.FindObjectOfType<HomePageView>();
-                if (homePage != null)
-                    homePage.RefreshUI();
+                bool taken = result.AccountInfo?.TitleInfo?.DisplayName
+                    ?.Equals(username, StringComparison.OrdinalIgnoreCase) == true;
+                callback?.Invoke(!taken);
             },
-            error => { Debug.LogError($"[PlayFabManager] AwardTrophyReward error: {error.GenerateErrorReport()}"); });
+            error => callback?.Invoke(true));
     }
 
-    // ── Deduct Coins ──────────────────────────────────────────────────────────
+    // ══════════════════════════════════════════════════════════════════════════
+    // COINS — all reads/writes go directly to PlayFab, UI updated via CoinsUIManager
+    // ══════════════════════════════════════════════════════════════════════════
+
+    private void HandleFetchCoins()
+    {
+        PlayFabClientAPI.GetUserInventory(
+            new GetUserInventoryRequest(),
+            result =>
+            {
+                int coins = 0;
+                if (result.VirtualCurrency != null &&
+                    result.VirtualCurrency.TryGetValue(CoinCurrencyCode, out int c))
+                    coins = c;
+                CoinsUIManager.UpdateCoins(coins);
+            },
+            error => Debug.LogWarning("[PlayFab] FetchCoins failed: " + error.ErrorMessage));
+    }
+
+    private void HandleAddCoins(int amount, string reason)
+    {
+        PlayFabClientAPI.AddUserVirtualCurrency(
+            new AddUserVirtualCurrencyRequest { VirtualCurrency = CoinCurrencyCode, Amount = amount },
+            result =>
+            {
+                CoinsUIManager.UpdateCoins(result.Balance);
+                SavePlayerStats(null);
+            },
+            err => Debug.LogWarning("[PlayFab] AddCoins failed: " + err.ErrorMessage));
+    }
 
     private void HandleDeductCoins(int amount)
     {
-        PlayFabClientAPI.SubtractUserVirtualCurrency(
-            new SubtractUserVirtualCurrencyRequest
-            {
-                VirtualCurrency = "CO",
-                Amount = amount
-            },
+        PlayFabClientAPI.GetUserInventory(
+            new GetUserInventoryRequest(),
             result =>
             {
-                Debug.Log($"[PlayFabManager] Deducted {amount} coins. New balance: {result.Balance}");
-                PlayerDataManager.UpdateCoins(result.Balance);
+                int live = 0;
+                if (result.VirtualCurrency != null &&
+                    result.VirtualCurrency.TryGetValue(CoinCurrencyCode, out int c))
+                    live = c;
+
+                if (live < amount)
+                {
+                    EventManager.FireShowPopUp("Not enough coins!");
+                    return;
+                }
+
+                PlayFabClientAPI.SubtractUserVirtualCurrency(
+                    new SubtractUserVirtualCurrencyRequest { VirtualCurrency = CoinCurrencyCode, Amount = amount },
+                    subResult =>
+                    {
+                        CoinsUIManager.UpdateCoins(subResult.Balance);
+                        SavePlayerStats(null);
+                    },
+                    err => Debug.LogWarning("[PlayFab] DeductCoins failed: " + err.ErrorMessage));
             },
-            error =>
-            {
-                Debug.LogError($"[PlayFabManager] DeductCoins error: {error.GenerateErrorReport()}");
-                PlayerDataManager.AddCoins(amount);
-            });
+            err => Debug.LogWarning("[PlayFab] GetInventory(deduct) failed: " + err.ErrorMessage));
     }
 
-    // ── Fetch Game Modes ──────────────────────────────────────────────────────
-
-    private void HandleFetchGameModes()
+    private void HandleAwardTrophyReward()
     {
+        // HandleAddCoins(10, "trophy_milestone_reward");
+        PlayerDataManager.SetLastRewardedMilestone(PlayerDataManager.GetCurrentMilestone());
+        SavePlayerStats(null);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // TITLE DATA
+    // ══════════════════════════════════════════════════════════════════════════
+
+    private void HandleFetchTitleData()
+    {
+        if (PlayerDataManager.IsTitleConfigInitialized) return;
+
         PlayFabClientAPI.GetTitleData(
-            new GetTitleDataRequest
-            {
-                Keys = new List<string> { "GameModeConfig" }
-            },
+            new GetTitleDataRequest { Keys = new List<string> { TitleConfigKey } },
             result =>
             {
-                if (result.Data.ContainsKey("GameModeConfig"))
+                if (result.Data != null && result.Data.TryGetValue(TitleConfigKey, out string json))
                 {
-                    string json = result.Data["GameModeConfig"];
-
                     try
                     {
-                        GameModeConfig config = JsonUtility.FromJson<GameModeConfig>(json);
-                        GameModeManager.Initialize(config.entryFees);
-                        EventManager.FireGameModesFetched();
+                        var config = JsonUtility.FromJson<TitleConfigData>(json);
+                        if (config != null)
+                        {
+                            PlayerDataManager.InitializeTitleConfig(config);
+                            GameModeManager.Initialize(config.entryFees);
+                            EventManager.FireGameModesFetched();
+                            EventManager.FireTitleDataFetched();
+                        }
                     }
-                    catch (System.Exception e)
+                    catch (Exception e)
                     {
-                        Debug.LogError($"[PlayFabManager] Failed to parse GameModeConfig: {e.Message}");
-                        GameModeManager.Initialize(new List<int> { 120, 300, 600 });
-                        EventManager.FireGameModesFetched();
+                        Debug.LogError("[PlayFab] Failed to parse TitleConfigData: " + e.Message);
                     }
                 }
-                else
-                {
-                    Debug.LogWarning("[PlayFabManager] GameModeConfig not found. Using defaults.");
-                    GameModeManager.Initialize(new List<int> { 120, 300, 600 });
-                    EventManager.FireGameModesFetched();
-                }
             },
-            error =>
-            {
-                Debug.LogError($"[PlayFabManager] FetchGameModes error: {error.GenerateErrorReport()}");
-                GameModeManager.Initialize(new List<int> { 120, 300, 600 });
-                EventManager.FireGameModesFetched();
-            });
+            error => Debug.LogWarning("[PlayFab] GetTitleData failed: " + error.ErrorMessage));
     }
 
-    // ── Username Validation ───────────────────────────────────────────────────
-
-    private void HandleCheckUsernameAvailability(string username, System.Action<bool> callback)
-    {
-        PlayFabClientAPI.GetAccountInfo(
-            new GetAccountInfoRequest
-            {
-                TitleDisplayName = username
-            },
-            result => { callback?.Invoke(false); },
-            error =>
-            {
-                if (error.Error == PlayFabErrorCode.AccountNotFound)
-                {
-                    callback?.Invoke(true);
-                }
-                else
-                {
-                    Debug.LogError($"[PlayFabManager] CheckUsername error: {error.GenerateErrorReport()}");
-                    callback?.Invoke(false);
-                }
-            });
-    }
-
-    // ── Fetch Friends ─────────────────────────────────────────────────────────
+    // ══════════════════════════════════════════════════════════════════════════
+    // FRIENDS
+    // ══════════════════════════════════════════════════════════════════════════
 
     private void HandleFetchFriends()
     {
         PlayFabClientAPI.GetFriendsList(
-            new GetFriendsListRequest
+            new GetFriendsListRequest(),
+            result =>
             {
-                ProfileConstraints = new PlayerProfileViewConstraints
+                var friends = new List<FriendData>();
+                if (result.Friends == null || result.Friends.Count == 0)
                 {
-                    ShowDisplayName = true
-                }
-            },
-            result => { StartCoroutine(FetchFriendDataCoroutine(result.Friends)); },
-            error =>
-            {
-                Debug.LogError($"[PlayFabManager] GetFriendsList error: {error.GenerateErrorReport()}");
-                FriendsManager.Initialize(new List<FriendData>());
-                EventManager.FireFriendsFetched();
-            });
-    }
-
-    private IEnumerator FetchFriendDataCoroutine(List<FriendInfo> friendInfos)
-    {
-        List<FriendData> friends = new List<FriendData>();
-
-        foreach (var friendInfo in friendInfos)
-        {
-            bool dataFetched = false;
-            FriendData friendData = null;
-
-            PlayFabClientAPI.GetUserData(
-                new GetUserDataRequest
-                {
-                    PlayFabId = friendInfo.FriendPlayFabId,
-                    Keys = new List<string> { "PlayerStats" }
-                },
-                result =>
-                {
-                    PlayerStatsData stats = new PlayerStatsData();
-
-                    if (result.Data != null && result.Data.ContainsKey("PlayerStats"))
-                    {
-                        try
-                        {
-                            stats = JsonUtility.FromJson<PlayerStatsData>(result.Data["PlayerStats"].Value);
-                        }
-                        catch
-                        {
-                        }
-                    }
-
-                    friendData = new FriendData(
-                        friendInfo.FriendPlayFabId,
-                        friendInfo.Profile?.DisplayName ?? "Unknown",
-                        stats.trophies,
-                        stats.avatarIndex
-                    );
-
-                    dataFetched = true;
-                },
-                error =>
-                {
-                    friendData = new FriendData(
-                        friendInfo.FriendPlayFabId,
-                        friendInfo.Profile?.DisplayName ?? "Unknown",
-                        0,
-                        0
-                    );
-                    dataFetched = true;
-                });
-
-            while (!dataFetched)
-                yield return null;
-
-            if (friendData != null)
-                friends.Add(friendData);
-        }
-
-        FriendsManager.Initialize(friends);
-        EventManager.FireFriendsFetched();
-    }
-
-    // ── Add Friend ────────────────────────────────────────────────────────────
-
-    private void HandleAddFriend(string username)
-    {
-        // 1) Resolve username -> PlayFabId
-        PlayFabClientAPI.GetAccountInfo(
-            new GetAccountInfoRequest { TitleDisplayName = username },
-            acc =>
-            {
-                var friendId = acc.AccountInfo?.PlayFabId;
-                if (string.IsNullOrEmpty(friendId))
-                {
-                    EventManager.FireAddFriendFailed($"Username '{username}' not found.");
+                    FriendsManager.Initialize(friends);
+                    EventManager.FireFriendsFetched();
                     return;
                 }
 
-                // 2) Add friend by PlayFabId (more reliable)
+                int remaining = result.Friends.Count;
+                foreach (var f in result.Friends)
+                {
+                    string friendId = f.FriendPlayFabId;
+                    PlayFabClientAPI.GetUserData(
+                        new GetUserDataRequest { PlayFabId = friendId, Keys = new List<string> { PlayerStatsKey } },
+                        dataResult =>
+                        {
+                            int trophies = 0, avatar = 0;
+                            if (dataResult.Data != null &&
+                                dataResult.Data.TryGetValue(PlayerStatsKey, out var dataEntry))
+                            {
+                                try
+                                {
+                                    var s = JsonUtility.FromJson<PlayerStatsData>(dataEntry.Value);
+                                    if (s != null)
+                                    {
+                                        trophies = s.trophies;
+                                        avatar = s.avatarIndex;
+                                    }
+                                }
+                                catch
+                                {
+                                }
+                            }
+
+                            friends.Add(new FriendData
+                            {
+                                PlayFabId = friendId,
+                                DisplayName = f.TitleDisplayName ?? "Player",
+                                Trophies = trophies,
+                                AvatarIndex = avatar
+                            });
+                            if (--remaining <= 0)
+                            {
+                                FriendsManager.Initialize(friends);
+                                EventManager.FireFriendsFetched();
+                            }
+                        },
+                        _ =>
+                        {
+                            friends.Add(new FriendData
+                            {
+                                PlayFabId = friendId,
+                                DisplayName = f.TitleDisplayName ?? "Player"
+                            });
+                            if (--remaining <= 0)
+                            {
+                                FriendsManager.Initialize(friends);
+                                EventManager.FireFriendsFetched();
+                            }
+                        });
+                }
+            },
+            error => Debug.LogWarning("[PlayFab] GetFriendsList failed: " + error.ErrorMessage));
+    }
+
+    private void HandleAddFriend(string username)
+    {
+        PlayFabClientAPI.GetAccountInfo(
+            new GetAccountInfoRequest { TitleDisplayName = username },
+            result =>
+            {
+                string friendId = result.AccountInfo?.PlayFabId;
+                if (string.IsNullOrEmpty(friendId))
+                {
+                    EventManager.FireAddFriendFailed("Player not found.");
+                    return;
+                }
+
+                if (friendId == PlayerDataManager.PlayFabId)
+                {
+                    EventManager.FireAddFriendFailed("You cannot add yourself.");
+                    return;
+                }
+
                 PlayFabClientAPI.AddFriend(
                     new AddFriendRequest { FriendPlayFabId = friendId },
                     _ =>
                     {
-                        // 3) Fetch and cache that single friend + notify UI
-                        FetchSingleFriendData(friendId); // this already does FireFriendAdded(friendData)
+                        PlayFabClientAPI.GetUserData(
+                            new GetUserDataRequest { PlayFabId = friendId, Keys = new List<string> { PlayerStatsKey } },
+                            dataResult =>
+                            {
+                                int trophies = 0, avatar = 0;
+                                if (dataResult.Data != null && dataResult.Data.TryGetValue(PlayerStatsKey, out var e2))
+                                {
+                                    try
+                                    {
+                                        var s = JsonUtility.FromJson<PlayerStatsData>(e2.Value);
+                                        if (s != null)
+                                        {
+                                            trophies = s.trophies;
+                                            avatar = s.avatarIndex;
+                                        }
+                                    }
+                                    catch
+                                    {
+                                    }
+                                }
 
-                        // Optional: refresh full list in background
-                        // HandleFetchFriends();
+                                FriendsManager.AddFriend(new FriendData
+                                {
+                                    PlayFabId = friendId,
+                                    DisplayName = result.AccountInfo?.TitleInfo?.DisplayName ?? username,
+                                    Trophies = trophies,
+                                    AvatarIndex = avatar
+                                });
+                                EventManager.FireFriendAdded(friendId);
+                            },
+                            _ =>
+                            {
+                                FriendsManager.AddFriend(new FriendData
+                                {
+                                    PlayFabId = friendId,
+                                    DisplayName = username
+                                });
+                                EventManager.FireFriendAdded(friendId);
+                            });
                     },
-                    error =>
-                    {
-                        if (error.Error == PlayFabErrorCode.UsersAlreadyFriends)
-                            EventManager.FireAddFriendFailed("Already friends with this user.");
-                        else
-                            EventManager.FireAddFriendFailed($"Error: {error.ErrorMessage}");
-                    }
-                );
+                    error => EventManager.FireAddFriendFailed("Could not add: " + error.ErrorMessage));
             },
-            error =>
-            {
-                if (error.Error == PlayFabErrorCode.AccountNotFound)
-                    EventManager.FireAddFriendFailed($"Username '{username}' not found.");
-                else
-                    EventManager.FireAddFriendFailed($"Error: {error.ErrorMessage}");
-            }
-        );
+            error => EventManager.FireAddFriendFailed("Player not found."));
     }
 
-    private IEnumerator DelayedFriendRefresh(string username)
-    {
-        // Wait a moment for PlayFab to sync
-        yield return new WaitForSeconds(0.5f);
-
-        // Fetch updated friends list
-        HandleFetchFriends();
-    }
-
-    private void RefreshFriendsListAfterAdd()
-    {
-        // Fetch friends list again to get the new friend's data
-        HandleFetchFriends();
-    }
-
-    private void FetchSingleFriendData(string playfabId)
-    {
-        PlayFabClientAPI.GetUserData(
-            new GetUserDataRequest
-            {
-                PlayFabId = playfabId,
-                Keys = new List<string> { "PlayerStats" }
-            },
-            result =>
-            {
-                PlayerStatsData stats = new PlayerStatsData();
-
-                if (result.Data != null && result.Data.ContainsKey("PlayerStats"))
-                {
-                    try
-                    {
-                        stats = JsonUtility.FromJson<PlayerStatsData>(result.Data["PlayerStats"].Value);
-                    }
-                    catch
-                    {
-                    }
-                }
-
-                PlayFabClientAPI.GetAccountInfo(
-                    new GetAccountInfoRequest { PlayFabId = playfabId },
-                    accountResult =>
-                    {
-                        FriendData friendData = new FriendData(
-                            playfabId,
-                            accountResult.AccountInfo.TitleInfo?.DisplayName ?? "Unknown",
-                            stats.trophies,
-                            stats.avatarIndex
-                        );
-
-                        FriendsManager.AddFriend(friendData);
-                        EventManager.FireFriendAdded(friendData);
-                    },
-                    error => Debug.LogError(error.GenerateErrorReport())
-                );
-            },
-            error => Debug.LogError(error.GenerateErrorReport())
-        );
-    }
-
-    // ── Remove Friend ─────────────────────────────────────────────────────────
-
-    private void HandleRemoveFriend(string playfabId)
+    private void HandleRemoveFriend(string playFabId)
     {
         PlayFabClientAPI.RemoveFriend(
-            new RemoveFriendRequest { FriendPlayFabId = playfabId },
-            result =>
+            new RemoveFriendRequest { FriendPlayFabId = playFabId },
+            _ =>
             {
-                FriendsManager.RemoveFriend(playfabId);
-                EventManager.FireFriendRemoved();
-                Debug.Log($"[PlayFabManager] Friend removed: {playfabId}");
+                FriendsManager.RemoveFriend(playFabId);
+                EventManager.FireFriendRemoved(playFabId);
             },
-            error => { Debug.LogError($"[PlayFabManager] RemoveFriend error: {error.GenerateErrorReport()}"); });
+            error => Debug.LogWarning("[PlayFab] RemoveFriend failed: " + error.ErrorMessage));
     }
 
-    // ── Helper: Save Player Stats ─────────────────────────────────────────────
+    // ══════════════════════════════════════════════════════════════════════════
+    // HELPERS
+    // ══════════════════════════════════════════════════════════════════════════
 
-    private void SavePlayerStatsToPlayFab()
+    private void SavePlayerStats(Action onComplete)
     {
-        var statsData = new PlayerStatsData
-        {
-            trophies = PlayerDataManager.Trophies,
-            avatarIndex = PlayerDataManager.AvatarIndex,
-            hasSetupProfile = PlayerDataManager.HasSetupProfile,
-            lastRewardedMilestone = PlayerDataManager.LastRewardedMilestone
-        };
-
+        var stats = PlayerDataManager.BuildStatsData();
+        string json = JsonUtility.ToJson(stats);
         PlayFabClientAPI.UpdateUserData(
-            new UpdateUserDataRequest
-            {
-                Data = new Dictionary<string, string>
-                {
-                    { "PlayerStats", JsonUtility.ToJson(statsData) }
-                },
-                Permission = UserDataPermission.Public
-            },
-            _ => Debug.Log("[PlayFabManager] PlayerStats saved."),
-            error => Debug.LogError($"[PlayFabManager] SavePlayerStats error: {error.GenerateErrorReport()}"));
+            new UpdateUserDataRequest { Data = new Dictionary<string, string> { { PlayerStatsKey, json } } },
+            _ => onComplete?.Invoke(),
+            error => Debug.LogWarning("[PlayFab] SavePlayerStats failed: " + error.ErrorMessage));
     }
 }

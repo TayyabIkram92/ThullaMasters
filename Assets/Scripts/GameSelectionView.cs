@@ -1,6 +1,5 @@
 using UnityEngine;
 using UnityEngine.UI;
-using UI;
 using System.Collections.Generic;
 using DG.Tweening;
 
@@ -10,11 +9,12 @@ using DG.Tweening;
 /// </summary>
 public class GameSelectionView : MonoBehaviour
 {
-    [Header("UI References")]
-    [SerializeField] private Transform  cardContainer;
+    [Header("UI References")] [SerializeField]
+    private Transform cardContainer;
+
     [SerializeField] private GameObject cardPrefab;
-    [SerializeField] private Button     backButton;
-    [SerializeField] private Text       coinsText;
+    [SerializeField] private Button backButton;
+    [SerializeField] private Text coinsText;
 
     private List<GameObject> _instantiatedCards = new List<GameObject>();
 
@@ -29,10 +29,6 @@ public class GameSelectionView : MonoBehaviour
     private void OnEnable()
     {
         EventManager.OnGameModeSelected += HandleGameModeSelected;
-
-        if (coinsText != null)
-            coinsText.text = PlayerDataManager.Coins.ToString();
-
         SpawnGameModeCards();
     }
 
@@ -99,7 +95,8 @@ public class GameSelectionView : MonoBehaviour
     private void DestroyAllCards()
     {
         foreach (var card in _instantiatedCards)
-            if (card != null) Destroy(card);
+            if (card != null)
+                Destroy(card);
 
         _instantiatedCards.Clear();
     }
@@ -108,22 +105,21 @@ public class GameSelectionView : MonoBehaviour
 
     private void HandleGameModeSelected(GameModeData modeData)
     {
-        // Check coins
-        if (PlayerDataManager.Coins < modeData.EntryFee)
+        EventManager.FireGetCoinsRequested(coins =>
         {
-            Debug.LogWarning($"[GameSelectionView] Not enough coins. Need: {modeData.EntryFee}, Have: {PlayerDataManager.Coins}");
-            EventManager.FireShowView(ViewType.UserPopUp, showAsDialogue: true);
-            EventManager.FireShowPopUp(
-                $"You need {modeData.EntryFee} coins to enter this game mode.\nYou have {PlayerDataManager.Coins} coins.");
-            return;
-        }
+            if (coins < modeData.EntryFee)
+            {
+                Debug.LogWarning($"[GameSelectionView] Not enough coins. Need: {modeData.EntryFee}, Have: {coins}");
+                EventManager.FireShowView(ViewType.UserPopUp, showAsDialogue: true);
+                EventManager.FireShowPopUp(
+                    $"You need {modeData.EntryFee} coins to enter this game mode.\nYou have {coins} coins.");
+                return;
+            }
 
-        // Store the selected mode FIRST so MatchmakingView can read it in OnEnable
-        // This must happen before FireShowView — FireShowView calls SetActive(true)
-        // which triggers OnEnable on MatchmakingView immediately
-        GameModeManager.SetSelectedMode(modeData);
-
-        EventManager.FireShowView(ViewType.Matchmaking);
+            // ← These two were outside the callback before — that was a bug
+            GameModeManager.SetSelectedMode(modeData);
+            EventManager.FireShowView(ViewType.Matchmaking);
+        });
     }
 
     private void OnBackClicked()

@@ -65,7 +65,7 @@ MonoBehaviour:
   m_OnCullStateChanged:
     m_PersistentCalls:
       m_Calls: []
-  m_Sprite: {fileID: 21300000, guid: 85d563acd5adc7141b6fc53c9995e868, type: 3}
+  m_Sprite: {fileID: 21300000, guid: c2ea1852d0f5ad945a69aa568552c319, type: 3}
   m_Type: 0
   m_PreserveAspect: 0
   m_FillCenter: 1
@@ -162,9 +162,9 @@ GameObject:
   - component: {fileID: 3733302368489525368}
   - component: {fileID: 7598911546339979921}
   - component: {fileID: 3379659446668362088}
-  - component: {fileID: 4725607230524290852}
+  - component: {fileID: 2088466539144719464}
   m_Layer: 5
-  m_Name: FriendCard
+  m_Name: _OnlineFriendCard
   m_TagString: Untagged
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
@@ -233,7 +233,7 @@ MonoBehaviour:
   m_FillOrigin: 0
   m_UseSpriteMesh: 0
   m_PixelsPerUnitMultiplier: 1
---- !u!114 &4725607230524290852
+--- !u!114 &2088466539144719464
 MonoBehaviour:
   m_ObjectHideFlags: 0
   m_CorrespondingSourceObject: {fileID: 0}
@@ -242,13 +242,13 @@ MonoBehaviour:
   m_GameObject: {fileID: 883190085456220548}
   m_Enabled: 1
   m_EditorHideFlags: 0
-  m_Script: {fileID: 11500000, guid: 421f99f69eaf4ed89139deacf65f3c3b, type: 3}
+  m_Script: {fileID: 11500000, guid: 33cd184de884a944b8fd871a37c056de, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
   avatarImage: {fileID: 5291183255876920167}
   displayNameTxt: {fileID: 8048301848295784255}
-  trophiesTxt: {fileID: 6695605929043750611}
-  deleteButton: {fileID: 3562593728644674091}
+  friendNumberTxt: {fileID: 6695605929043750611}
+  inviteButton: {fileID: 3562593728644674091}
   avatarSprites:
   - {fileID: -799175169, guid: b90c48f1c189d6d44bfad3b3307c1c70, type: 3}
   - {fileID: -374478721, guid: b90c48f1c189d6d44bfad3b3307c1c70, type: 3}
@@ -604,7 +604,7 @@ GameObject:
   - component: {fileID: 6967350998671338566}
   - component: {fileID: 3562593728644674091}
   m_Layer: 5
-  m_Name: DeleteBtn
+  m_Name: InviteBtn
   m_TagString: Untagged
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
@@ -658,7 +658,7 @@ MonoBehaviour:
   m_OnCullStateChanged:
     m_PersistentCalls:
       m_Calls: []
-  m_Sprite: {fileID: 21300000, guid: 4b708fbbbd42400448c3b5f3498e304c, type: 3}
+  m_Sprite: {fileID: 21300000, guid: 6bffb5891aaa6464a9f2231c7378aa5d, type: 3}
   m_Type: 1
   m_PreserveAspect: 0
   m_FillCenter: 1

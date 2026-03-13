@@ -1,86 +1,59 @@
 using UnityEngine;
 using UnityEngine.UI;
-using UI;
+using TMPro;
 
+/// <summary>
+/// Confirm-delete friend dialogue. Shown on top of FriendsView.
+/// FriendsView never hidden.
+/// </summary>
 public class DeleteFriendView : MonoBehaviour
 {
-    [Header("UI References")] [SerializeField]
-    private Button deleteButton;
-
+    [SerializeField] private Text friendNameTxt;
+    [SerializeField] private Button confirmButton;
     [SerializeField] private Button cancelButton;
-    [SerializeField] private Text confirmationText;
 
-    private string _pendingDeleteFriendId;
-    private string _pendingDeleteFriendName;
-
-    private void Awake()
-    {
-        if (deleteButton != null)
-            deleteButton.onClick.AddListener(OnDeleteClicked);
-
-        if (cancelButton != null)
-            cancelButton.onClick.AddListener(OnCancelClicked);
-    }
+    private string _pendingFriendId;
 
     private void OnEnable()
     {
+        confirmButton.onClick.AddListener(OnConfirmClicked);
+        cancelButton.onClick.AddListener(OnCancelClicked);
+
+        // Subscribe BEFORE reading prefs so we catch the event
         EventManager.OnFriendRemoved += HandleFriendRemoved;
 
-        _pendingDeleteFriendId = PlayerPrefs.GetString("PendingDeleteFriendId", "");
-        _pendingDeleteFriendName = PlayerPrefs.GetString("PendingDeleteFriendName", "");
+        _pendingFriendId = PlayerPrefs.GetString("PendingDeleteFriendId", "");
+        string friendName = PlayerPrefs.GetString("PendingDeleteFriendName", "this friend");
+        friendNameTxt.text = "Are you sure you want to remove \n" + friendName + "?";
 
-        if (confirmationText != null && !string.IsNullOrEmpty(_pendingDeleteFriendName))
-        {
-            confirmationText.text = $"Are you sure you want to remove {_pendingDeleteFriendName}?";
-        }
+        confirmButton.interactable = !string.IsNullOrEmpty(_pendingFriendId);
     }
 
     private void OnDisable()
     {
-        EventManager.OnFriendRemoved -= HandleFriendRemoved;
+        confirmButton.onClick.RemoveListener(OnConfirmClicked);
+        cancelButton.onClick.RemoveListener(OnCancelClicked);
 
+        EventManager.OnFriendRemoved -= HandleFriendRemoved;
+    }
+
+    private void OnConfirmClicked()
+    {
+        if (string.IsNullOrEmpty(_pendingFriendId)) return;
+        confirmButton.interactable = false;
+        EventManager.FireRemoveFriendRequested(_pendingFriendId);
+    }
+
+    private void HandleFriendRemoved(string playFabId)
+    {
         PlayerPrefs.DeleteKey("PendingDeleteFriendId");
         PlayerPrefs.DeleteKey("PendingDeleteFriendName");
-    }
-
-    private void OnDestroy()
-    {
-        if (deleteButton != null) deleteButton.onClick.RemoveAllListeners();
-        if (cancelButton != null) cancelButton.onClick.RemoveAllListeners();
-    }
-
-    private void OnDeleteClicked()
-    {
-        if (string.IsNullOrEmpty(_pendingDeleteFriendId))
-        {
-            EventManager.FireHideView(ViewType.DeleteFriend);
-            return;
-        }
-
+        PlayerPrefs.Save();
         EventManager.FireHideView(ViewType.DeleteFriend);
-        EventManager.FireRemoveFriendRequested(_pendingDeleteFriendId);
     }
 
     private void OnCancelClicked()
     {
         EventManager.FireHideView(ViewType.DeleteFriend);
-    }
-
-    private void HandleFriendRemoved()
-    {
-        EventManager.FireHideView(ViewType.DeleteFriend);
-        ShowPopup("Friend removed successfully.");
-    }
-
-    private void ShowPopup(string message)
-    {
-        EventManager.FireShowView(ViewType.UserPopUp, showAsDialogue: true);
-        StartCoroutine(ShowMessageDelayed(message));
-    }
-
-    private System.Collections.IEnumerator ShowMessageDelayed(string message)
-    {
-        yield return null;
-        EventManager.FireShowPopUp(message);
     }
 }

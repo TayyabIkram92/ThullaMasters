@@ -413,7 +413,7 @@ public class InGameManager : MonoBehaviour
         _pendingHand          = null;
         _pendingSeatedPlayers = null;
 
-        EventManager.FireShowView(UI.ViewType.Home);
+        EventManager.FireShowView(ViewType.Home);
     }
 
     // ── Firestore Async Helpers ───────────────────────────────────────────────
