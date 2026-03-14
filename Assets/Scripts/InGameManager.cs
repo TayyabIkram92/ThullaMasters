@@ -407,6 +407,38 @@ public class InGameManager : MonoBehaviour
 
     private void HandleLeaveGame()
     {
+        // If we leave during the dealing phase (before OnGameReady fires),
+        // the room may still be in "starting" or "dealing" status.
+        // Clean it up so it isn't a ghost room that blocks future matchmaking.
+        if (_room != null && FirebaseManager.DB != null)
+        {
+            string roomId = _room.roomId;
+
+            if (_isHost)
+            {
+                // Host leaving during deal — delete the room entirely
+                FirebaseManager.DB
+                    .Collection(RoomsCollection)
+                    .Document(roomId)
+                    .DeleteAsync();
+                Debug.Log($"[InGameManager] Host left during deal — deleted room {roomId}.");
+            }
+            else
+            {
+                // Non-host leaving during deal — zero heartbeat so host detects departure
+                // on next poll and replaces with a bot (WaitForAllPlayersReadyAsync timeout)
+                string myId = PlayerDataManager.PlayFabId;
+                FirebaseManager.DB
+                    .Collection(RoomsCollection)
+                    .Document(roomId)
+                    .UpdateAsync(new Dictionary<string, object>
+                    {
+                        { $"playerLastSeen.{myId}", 0L }
+                    });
+                Debug.Log($"[InGameManager] Non-host left during deal — zeroed heartbeat in room {roomId}.");
+            }
+        }
+
         _room      = null;
         _isHost    = false;
         _proceeded = false;

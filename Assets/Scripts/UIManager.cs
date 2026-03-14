@@ -54,6 +54,9 @@ public class UIManager : MonoBehaviour
     private void HideAllViews()
     {
         foreach (var entry in views)
-            entry.viewObject.SetActive(false);
+        {
+            if (entry.viewType != ViewType.InvitePopUp)
+                entry.viewObject.SetActive(false);
+        }
     }
 }

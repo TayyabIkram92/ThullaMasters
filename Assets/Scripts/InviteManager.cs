@@ -6,7 +6,11 @@ using UnityEngine;
 
 /// <summary>
 /// Manages friend invite system via Firestore.
-/// invites/{recipientId}/pending/{docId} = {senderId, senderName, roomId, timestamp}
+///
+/// Paths:
+///   invites/{recipientId}/pending/{docId}            — invite sent to recipient
+///   rooms/{roomId}/inviteResponses/{recipientId}     — accept/reject written back so host is notified
+///
 /// Listener starts automatically once both Firebase and PlayFabId are ready,
 /// regardless of initialization order.
 /// </summary>
@@ -14,6 +18,8 @@ public class InviteManager : MonoBehaviour
 {
     private const string InvitesCollection = "invites";
     private const string PendingSubcollection = "pending";
+    private const string RoomsCollection = "rooms";
+    private const string InviteResponsesSubcol = "inviteResponses";
 
     public static string CurrentRoomId { get; private set; }
 
@@ -21,6 +27,7 @@ public class InviteManager : MonoBehaviour
     public static void ClearCurrentRoomId() => CurrentRoomId = null;
 
     private ListenerRegistration _inviteListener;
+    private ListenerRegistration _responseListener; // host listens for accept/reject responses
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -29,12 +36,11 @@ public class InviteManager : MonoBehaviour
         EventManager.OnSendInviteRequested += HandleSendInvite;
         EventManager.OnAcceptInviteRequested += HandleAcceptInvite;
         EventManager.OnRejectInviteRequested += HandleRejectInvite;
+        EventManager.OnInviteResponseRequested += HandleInviteResponse;
         EventManager.OnMatchFound += HandleMatchFound;
         EventManager.OnRoomLeft += HandleRoomLeft;
         EventManager.OnInviteReceived += HandleInviteReceived;
 
-        // Use coroutine to wait for both Firebase and PlayFabId —
-        // safe regardless of which initializes first.
         StartCoroutine(WaitAndStartListening());
     }
 
@@ -43,20 +49,21 @@ public class InviteManager : MonoBehaviour
         EventManager.OnSendInviteRequested -= HandleSendInvite;
         EventManager.OnAcceptInviteRequested -= HandleAcceptInvite;
         EventManager.OnRejectInviteRequested -= HandleRejectInvite;
+        EventManager.OnInviteResponseRequested -= HandleInviteResponse;
         EventManager.OnMatchFound -= HandleMatchFound;
         EventManager.OnRoomLeft -= HandleRoomLeft;
         EventManager.OnInviteReceived -= HandleInviteReceived;
 
         StopAllCoroutines();
         StopInviteListener();
+        StopResponseListener();
     }
 
     // ── Listener Setup ────────────────────────────────────────────────────────
 
     /// <summary>
     /// Waits until both FirebaseManager.DB and PlayerDataManager.PlayFabId
-    /// are ready before starting the invite listener. Works regardless of
-    /// initialization order since it polls every frame via WaitUntil.
+    /// are ready. Works regardless of initialization order.
     /// </summary>
     private IEnumerator WaitAndStartListening()
     {
@@ -67,6 +74,10 @@ public class InviteManager : MonoBehaviour
         StartListeningForInvites();
     }
 
+    /// <summary>
+    /// Listens to invites/{myId}/pending/ — scoped strictly to this player only.
+    /// Invites sent to others are written to their own path and never seen here.
+    /// </summary>
     private void StartListeningForInvites()
     {
         StopInviteListener();
@@ -74,9 +85,6 @@ public class InviteManager : MonoBehaviour
         string myId = PlayerDataManager.PlayFabId;
         if (string.IsNullOrEmpty(myId) || FirebaseManager.DB == null) return;
 
-        // Listen ONLY to this player's own pending subcollection.
-        // Path: invites/{myId}/pending/
-        // Invites sent to others are written to invites/{recipientId}/pending/ — separate path.
         _inviteListener = FirebaseManager.DB
             .Collection(InvitesCollection)
             .Document(myId)
@@ -110,8 +118,44 @@ public class InviteManager : MonoBehaviour
                     PlayerPrefs.SetInt("InviteEntryFee", entryFee);
                     PlayerPrefs.Save();
 
-                    // Fire local C# event — only this device receives it
                     EventManager.FireInviteReceived(senderName, senderId, roomId);
+                }
+            });
+    }
+
+    /// <summary>
+    /// Host listens to rooms/{roomId}/inviteResponses/ to get notified
+    /// when invited friends accept or reject. Called after sending an invite.
+    /// </summary>
+    private void StartListeningForInviteResponses(string roomId)
+    {
+        StopResponseListener();
+
+        if (string.IsNullOrEmpty(roomId) || FirebaseManager.DB == null) return;
+
+        _responseListener = FirebaseManager.DB
+            .Collection(RoomsCollection)
+            .Document(roomId)
+            .Collection(InviteResponsesSubcol)
+            .Listen(snapshot =>
+            {
+                foreach (var change in snapshot.GetChanges())
+                {
+                    if (change.ChangeType != DocumentChange.Type.Added) continue;
+
+                    var doc = change.Document;
+                    string recipientId = doc.Id;
+                    bool accepted = false;
+
+                    if (doc.TryGetValue("accepted", out bool a)) accepted = a;
+
+                    // Clean up the response doc immediately
+                    doc.Reference.DeleteAsync();
+
+                    if (accepted)
+                        EventManager.FireInviteAccepted(recipientId);
+                    else
+                        EventManager.FireInviteRejected(recipientId);
                 }
             });
     }
@@ -122,11 +166,16 @@ public class InviteManager : MonoBehaviour
         _inviteListener = null;
     }
 
-    // ── Invite Received ───────────────────────────────────────────────────────
+    private void StopResponseListener()
+    {
+        _responseListener?.Stop();
+        _responseListener = null;
+    }
+
+    // ── Invite Received (recipient side) ──────────────────────────────────────
 
     /// <summary>
-    /// Handles invite popup globally — works from any screen since
-    /// InviteManager is always active in a single-scene setup.
+    /// Shows invite popup globally regardless of which screen the recipient is on.
     /// </summary>
     private void HandleInviteReceived(string senderName, string senderId, string roomId)
     {
@@ -137,12 +186,12 @@ public class InviteManager : MonoBehaviour
         EventManager.FireShowView(ViewType.InvitePopUp, true);
     }
 
-    // ── Send Invite ───────────────────────────────────────────────────────────
+    // ── Send Invite (host side) ───────────────────────────────────────────────
 
     /// <summary>
     /// Writes invite doc to invites/{recipientId}/pending/.
-    /// Only fires on the local sender's device via C# event.
     /// Auto-deletes after 10 seconds if recipient hasn't acted.
+    /// Starts response listener so host knows when friend accepts/rejects.
     /// </summary>
     private void HandleSendInvite(string recipientPlayFabId, string roomId)
     {
@@ -176,6 +225,9 @@ public class InviteManager : MonoBehaviour
 
                 StartCoroutine(DeleteInviteAfterDelay(task.Result, 10f));
             });
+
+        // Start listening for the response so host knows accept/reject
+        StartListeningForInviteResponses(roomId);
     }
 
     private IEnumerator DeleteInviteAfterDelay(DocumentReference docRef, float delay)
@@ -184,15 +236,50 @@ public class InviteManager : MonoBehaviour
         docRef?.DeleteAsync();
     }
 
-    // ── Accept / Reject ───────────────────────────────────────────────────────
+    // ── Invite Response (recipient writes, host reads) ────────────────────────
 
     /// <summary>
-    /// Cleans up the invite doc on accept.
-    /// MatchmakingManager is also subscribed to OnAcceptInviteRequested
-    /// and handles the actual room join independently.
+    /// Recipient writes accept/reject to rooms/{roomId}/inviteResponses/{myId}.
+    /// Host's _responseListener picks this up and fires FireInviteAccepted/Rejected.
+    /// </summary>
+    private void HandleInviteResponse(string roomId, string senderId, bool accepted)
+    {
+        if (FirebaseManager.DB == null || string.IsNullOrEmpty(roomId)) return;
+
+        string myId = PlayerDataManager.PlayFabId;
+        if (string.IsNullOrEmpty(myId)) return;
+
+        var responseData = new Dictionary<string, object>
+        {
+            { "accepted", accepted },
+            { "recipientId", myId },
+            { "timestamp", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() }
+        };
+
+        // Keyed by recipientId so host knows exactly who responded
+        FirebaseManager.DB
+            .Collection(RoomsCollection)
+            .Document(roomId)
+            .Collection(InviteResponsesSubcol)
+            .Document(myId)
+            .SetAsync(responseData)
+            .ContinueWith(task =>
+            {
+                if (task.IsFaulted)
+                    Debug.LogWarning("[InviteManager] Write invite response failed: " + task.Exception?.Message);
+            });
+    }
+
+    // ── Accept / Reject (recipient side cleanup) ──────────────────────────────
+
+    /// <summary>
+    /// Sets IsInvitedUser flag so MatchmakingView shows the correct invited state.
+    /// MatchmakingManager handles actual room join via OnAcceptInviteRequested.
     /// </summary>
     private void HandleAcceptInvite(string roomId)
     {
+        PlayerPrefs.SetInt("IsInvitedUser", 1);
+        PlayerPrefs.Save();
         CleanupMyInviteDoc();
     }
 
@@ -225,20 +312,15 @@ public class InviteManager : MonoBehaviour
 
     // ── Match / Room Events ───────────────────────────────────────────────────
 
-    /// <summary>
-    /// Stop listening once match is found — no more invites needed mid-game.
-    /// </summary>
     private void HandleMatchFound(RoomData room)
     {
         StopInviteListener();
+        StopResponseListener();
     }
 
-    /// <summary>
-    /// Re-start listening after leaving a room so player can receive invites again.
-    /// Uses coroutine to safely wait for DB/PlayFabId in case of re-login.
-    /// </summary>
     private void HandleRoomLeft()
     {
+        StopResponseListener();
         StartCoroutine(WaitAndStartListening());
     }
 }

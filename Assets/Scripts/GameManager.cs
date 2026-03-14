@@ -39,6 +39,13 @@ public class GameManager : MonoBehaviour
     [Header("Bot Difficulty")] [Tooltip("True = bots use hard AI strategy. False = bots use basic auto-play.")]
     public bool useHardBot = false;
 
+    [Header("Ghost Bot (treat specific human as bot)")]
+    [Tooltip("If true, any player whose PlayFab ID is listed below is treated as a bot.")]
+    public bool turnPlayerToBot = false;
+
+    [Tooltip("PlayFab IDs of players to treat as bots. One per line.")]
+    public string[] ghostBotIds = new string[0];
+
     private void Awake()
     {
         if (Instance != null && Instance != this)
@@ -86,6 +93,11 @@ public class GameManager : MonoBehaviour
         _roundLog.Clear();
         _initialHandSnapshot = "";
         _seatedPlayers = seatedPlayers != null ? new List<SlotData>(seatedPlayers) : new List<SlotData>();
+        if (turnPlayerToBot && ghostBotIds != null)
+            foreach (var slot in _seatedPlayers)
+            foreach (var ghostId in ghostBotIds)
+                if (slot.id == ghostId)
+                    slot.isBot = true;
         _myHand.Clear();
         foreach (var c in localHand) _myHand.Add(c.ShortCode);
         Debug.Log($"[GameManager] HandleGameReady. isHost={_isHost} hand={_myHand.Count} room={_room.roomId}");
@@ -179,6 +191,22 @@ public class GameManager : MonoBehaviour
                                    newGs.phase != _gs.phase ||
                                    newGs.cardsInPlay.Count != _gs.cardsInPlay.Count;
 
+                // ── Sound detection ───────────────────────────────────────────
+                // Detect sounds from the state diff so ALL clients (host and
+                // non-host) hear them, regardless of who executed the move.
+                int prevCardCount = _gs?.cardsInPlay.Count ?? 0;
+                int newCardCount = newGs.cardsInPlay.Count;
+                bool cardWasPlayed = newCardCount > prevCardCount;
+
+                bool thullaWasPlayed = false;
+                if (cardWasPlayed && newCardCount > 1 && !string.IsNullOrEmpty(newGs.leadSuit))
+                {
+                    // The newest card in play is the last one added
+                    var latestCard = newGs.cardsInPlay[newCardCount - 1];
+                    thullaWasPlayed = GetSuit(latestCard.card) != newGs.leadSuit;
+                }
+                // ─────────────────────────────────────────────────────────────
+
                 string localId = PlayerDataManager.PlayFabId;
 
                 _gs = newGs;
@@ -197,6 +225,11 @@ public class GameManager : MonoBehaviour
                 _gameActive = _gs.phase != GameState.PhaseFinished;
 
                 if (turnChanged) _isExecutingMove = false;
+
+                // Fire sounds BEFORE FireGameStateUpdated so the UI and audio
+                // update together in the same frame.
+                if (cardWasPlayed) EventManager.FirePlaySound(SoundType.PlayCard);
+                if (thullaWasPlayed) EventManager.FirePlaySound(SoundType.ThullaSound);
 
                 EventManager.FireGameStateUpdated(_gs);
 
@@ -276,9 +309,14 @@ public class GameManager : MonoBehaviour
 
         _turnTimerCoroutine = StartCoroutine(TurnTimerCoroutine(remaining));
 
-        if (_isHost && IsBot(currentId))
+        if (IsBot(currentId) && (_isHost || currentId == PlayerDataManager.PlayFabId))
         {
-            float botDelay = UnityEngine.Random.Range(1f, 3f);
+            float botDelay;
+            if (turnPlayerToBot && ghostBotIds != null && System.Array.IndexOf(ghostBotIds, currentId) >= 0)
+                botDelay = 3f;
+            else
+                botDelay = UnityEngine.Random.Range(1f, 3f);
+
             float effectiveDelay = Mathf.Min(botDelay, remaining - 1f);
             if (effectiveDelay < 0.5f) effectiveDelay = 0.5f;
             _botCoroutine = StartCoroutine(BotMoveCoroutine(currentId, effectiveDelay));
@@ -301,7 +339,13 @@ public class GameManager : MonoBehaviour
         {
             Debug.Log($"[GameManager] Bot timer expired for {currentId}.");
             StopBotCoroutine();
-            AutoPlay(currentId);
+            // Bug 5 fix: guard against double-play if BotMoveCoroutine already called
+            // AutoPlay but its async write hasn't completed yet.
+            if (!_isExecutingMove)
+            {
+                _isExecutingMove = true;
+                AutoPlay(currentId);
+            }
         }
     }
 
@@ -641,9 +685,6 @@ public class GameManager : MonoBehaviour
             _gs.leadSuit = GetSuit(cardCode);
 
         _gs.cardsInPlay.Add(new PlayedCard(playerId, cardCode));
-        EventManager.FirePlaySound(SoundType.PlayCard);
-        bool outOfSuitSound = _gs.cardsInPlay.Count > 1 && GetSuit(cardCode) != _gs.leadSuit;
-        if (outOfSuitSound) EventManager.FirePlaySound(SoundType.ThullaSound);
 
         if (playerId == PlayerDataManager.PlayFabId)
             EventManager.FireLocalHandUpdated(new List<string>(_myHand), _gs);
@@ -1381,11 +1422,25 @@ public class GameManager : MonoBehaviour
 
     private IEnumerator BotMoveCoroutine(string botId, float delay)
     {
+        // Bug 2 fix: snapshot the turn key at coroutine start so mid-flight _gs
+        // replacement by the Firestore listener cannot cause a false-pass or false-fail.
+        int expectedTurnKey = _lastProcessedTurnKey;
+
         yield return new WaitForSeconds(delay);
+
         if (!_gameActive || _gs == null) yield break;
+
+        // If the turn key changed while we were waiting, a newer ProcessCurrentTurn
+        // already launched a fresh BotMoveCoroutine for the correct turn — bail out.
+        if (_lastProcessedTurnKey != expectedTurnKey) yield break;
+
         // Re-check it's still this bot's turn AND they haven't played yet this round
         if (_gs.CurrentPlayerId != botId) yield break;
         if (_gs.cardsInPlay.Exists(pc => pc.playerId == botId)) yield break;
+
+        // Mark move in-flight so the TurnTimerCoroutine bot-fallback does not
+        // fire a second AutoPlay while this one's async write is still pending.
+        _isExecutingMove = true;
         AutoPlay(botId);
     }
 
@@ -1407,7 +1462,16 @@ public class GameManager : MonoBehaviour
         }
     }
 
-    private bool IsBot(string id) => id != null && id.StartsWith("BOT_");
+    private bool IsBot(string id)
+    {
+        if (id == null) return false;
+        if (id.StartsWith("BOT_")) return true;
+        if (!turnPlayerToBot || ghostBotIds == null) return false;
+        foreach (var ghostId in ghostBotIds)
+            if (ghostId == id)
+                return true;
+        return false;
+    }
 
     private string GetSecondHighestSuitCardPlayer(string excludeId, string leadSuit, List<PlayedCard> snapshot)
     {
@@ -1522,17 +1586,100 @@ public class GameManager : MonoBehaviour
     {
         _isExecutingMove = false;
 
-        bool ok = await WriteGameStateAsync();
-        if (!ok)
-            Debug.LogWarning("[GameManager] WriteGameStateAndProcess: write failed.");
+        const int maxAttempts = 4;
+        const int delayBetweenMs = 500; // 4 attempts × 500 ms = 2 seconds total
+        bool ok = false;
 
+        for (int attempt = 1; attempt <= maxAttempts; attempt++)
+        {
+            ok = await WriteGameStateAsync();
+            if (ok) break;
+
+            Debug.LogWarning(
+                $"[GameManager] WriteGameStateAndProcess: write failed (attempt {attempt}/{maxAttempts}).");
+
+            if (attempt < maxAttempts)
+                await Task.Delay(delayBetweenMs);
+        }
+
+        if (!ok)
+        {
+            Debug.LogError(
+                "[GameManager] WriteGameStateAndProcess: all 4 write attempts failed — not advancing turn to prevent desync.");
+            EventManager.FireShowPopUp("Network error. Please check your connection.");
+            return; // Do NOT advance turn — Firebase never confirmed the state
+        }
+
+        // Firebase confirmed — safe to advance turn
         EventManager.FireGameStateUpdated(_gs);
 
         if (_isHost && _gameActive)
-            ProcessCurrentTurn();
+            ProcessCurrentTurn(); // Bot check and BotMoveCoroutine start here
     }
 
     private void WriteGameStateAndProcess() => _ = WriteGameStateAndProcessAsync();
+
+    /// <summary>
+    /// Called by HostWatchdog (host only) when a non-host player's heartbeat times out.
+    /// Treats the disconnected player as Bhabhi (they lose) and continues the game
+    /// for everyone else. If removing them leaves only 1 active player, ends the game.
+    /// </summary>
+    public void ForceRemovePlayer(string playerId)
+    {
+        if (!_isHost || _gs == null || !_gameActive) return;
+        if (!_gs.activePlayers.Contains(playerId)) return;
+
+        Debug.LogWarning($"[GameManager] ForceRemovePlayer: {playerId} dropped out.");
+
+        // If it was this player's turn, clear any in-flight state
+        bool wasCurrentPlayer = _gs.CurrentPlayerId == playerId;
+        if (wasCurrentPlayer)
+        {
+            StopTurnTimer();
+            StopBotCoroutine();
+            _isExecutingMove = false;
+        }
+
+        // Clear their cards-in-play contribution so the round doesn't get stuck
+        _gs.cardsInPlay.RemoveAll(pc => pc.playerId == playerId);
+
+        // Remove from active players and mark as Bhabhi
+        _gs.activePlayers.Remove(playerId);
+        _gs.bhabhi = playerId;
+        AdjustCurrentIndexAfterRemoval();
+
+        if (CheckGameOver()) return;
+
+        // If they were mid-round and other players have already played cards,
+        // the round may now be complete — check and resolve
+        bool roundComplete = _gs.cardsInPlay.Count > 0 &&
+                             _gs.cardsInPlay.Count >= _gs.activePlayers.Count;
+        bool outOfSuit = _gs.cardsInPlay.Count > 1 &&
+                         !string.IsNullOrEmpty(_gs.leadSuit) &&
+                         GetSuit(_gs.cardsInPlay[_gs.cardsInPlay.Count - 1].card) != _gs.leadSuit;
+
+        if (outOfSuit && _gs.roundNumber > 1)
+        {
+            StopResolveCoroutine();
+            _lastProcessedTurnKey = -1;
+            _gs.turnStartTime = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            ShowCardsAndDelay(() => ResolveOutOfSuit());
+        }
+        else if (roundComplete)
+        {
+            StopResolveCoroutine();
+            _lastProcessedTurnKey = -1;
+            _gs.turnStartTime = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            ShowCardsAndDelay(() => ResolveRound());
+        }
+        else
+        {
+            // Reset turn key so the next ProcessCurrentTurn isn't treated as a dup
+            _lastProcessedTurnKey = -1;
+            _gs.turnStartTime = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            WriteGameStateAndProcess();
+        }
+    }
 
     private void HandleLeaveGame()
     {

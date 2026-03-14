@@ -5,25 +5,65 @@ using System.Threading.Tasks;
 using Firebase.Extensions;
 using Firebase.Firestore;
 using UnityEngine;
+using UnityEngine.SceneManagement;
+using Random = UnityEngine.Random;
 
 /// <summary>
-/// Handles Firestore matchmaking. Uses Firebase SDK correctly (no snap.Documents[0]).
-/// No Newtonsoft — uses JsonUtility for bot names.
+/// Handles Firestore matchmaking and ALL disconnect scenarios during matchmaking
+/// and dealing phases (before OnGameReady fires — HostWatchdog is not yet running).
+///
+/// HEARTBEAT SYSTEM (matchmaking phase):
+/// ─────────────────────────────────────
+/// Every player writes playerLastSeen/{myId} to the room the moment they join.
+/// Refreshed every HeartbeatInterval (8s).
+/// OnApplicationPause / OnApplicationFocus(false) immediately zeros the heartbeat
+/// AND calls HandleSelfDisconnect for immediate local cleanup + scene reload.
+///
+/// DISCONNECT RULES:
+/// ─────────────────
+/// Before coins deducted (room.players.Count < 4):
+///   → Delete room entirely. All players reload scene.
+///
+/// After coins deducted (room.players.Count >= 4, status = "starting"/"dealing"):
+///   → Leaver is Bhabhi (loses). All remaining players are winners → WinView.
+///   → Room deleted after WinView claims.
+///
+/// ALL CLIENTS watch ALL other players every CheckInterval (5s).
+/// Every client independently detects every dropout — not just host watching non-hosts.
+/// _disconnectHandled guard prevents double-fire from concurrent detections.
+/// AllPlayersAlive() validated before FireMatchFound to close the dropout-vs-start race.
 /// </summary>
 public class MatchmakingManager : MonoBehaviour
 {
     private const string RoomsCollection = "rooms";
     private const int MaxPlayers = 4;
-    private const float BotFillInterval = 20f;
+    private const float BotFillDelayMin = 5f;
+    private const float BotFillDelayMax = 10f;
+    private const float HeartbeatInterval = 8f; // write every 8s
+    private const float CheckInterval = 5f; // poll peers every 5s — fast enough to catch dropout before match starts
+    private const float DisconnectTimeout = 20f; // 20s stale = disconnected (verified by 4 missed checks)
 
+    // ── Bot name pool ─────────────────────────────────────────────────────────
     private string[] _botNames;
     private int _botCounter = 0;
+    private int _botNameIndex = 0;
 
+    // ── Room state ────────────────────────────────────────────────────────────
+    private string _currentRoomId;
+    private RoomData _currentRoom;
+    private bool _isHost;
+
+    // ── Matchmaking phase disconnect tracking ─────────────────────────────────
+    // Active from the moment we join/create a room until OnMatchFound + OnGameReady fires.
+    private bool _watchdogActive; // true while we are in a room pre-game
+    private bool _coinsDeducted; // mirror of MatchmakingView._hasDeductedCoins
+    private bool _disconnectHandled; // guard against double handling
+    private Coroutine _heartbeatCoroutine;
+    private Coroutine _watchCoroutine;
     private ListenerRegistration _roomListener;
     private Coroutine _botFillCoroutine;
-    private RoomData _currentRoom;
-    private bool _isHost = false;
-    private int _botNameIndex = 0;
+
+    // ── Unity lifecycle ───────────────────────────────────────────────────────
 
     private void OnEnable()
     {
@@ -32,6 +72,8 @@ public class MatchmakingManager : MonoBehaviour
         EventManager.OnAcceptInviteRequested += HandleAcceptInvite;
         EventManager.OnLeaveRoomRequested += HandleLeaveRoom;
         EventManager.OnFirebaseReady += OnFirebaseReady;
+        EventManager.OnDeductCoinsRequested += HandleCoinsDeducted;
+        EventManager.OnMatchFound += HandleMatchFound;
     }
 
     private void OnDisable()
@@ -41,13 +83,879 @@ public class MatchmakingManager : MonoBehaviour
         EventManager.OnAcceptInviteRequested -= HandleAcceptInvite;
         EventManager.OnLeaveRoomRequested -= HandleLeaveRoom;
         EventManager.OnFirebaseReady -= OnFirebaseReady;
+        EventManager.OnDeductCoinsRequested -= HandleCoinsDeducted;
+        EventManager.OnMatchFound -= HandleMatchFound;
 
         CleanupRoom();
     }
 
-    private void OnFirebaseReady()
+    // ── Platform hooks — IMMEDIATE disconnect on pause (backgrounded/locked) ──
+
+    /// <summary>
+    /// OnApplicationPause fires when the app is backgrounded, the lock button
+    /// is pressed, or the task-switcher is opened. Per spec: treat as immediate
+    /// disconnect if we are in an active room.
+    /// </summary>
+    private void OnApplicationPause(bool isPaused)
     {
-        LoadBotNames();
+        if (!isPaused || !_watchdogActive) return;
+
+        Debug.Log("[MatchmakingManager] App paused — declaring immediate disconnect.");
+
+        // Zero our heartbeat so peers detect the drop on their next poll
+        ZeroMyHeartbeat();
+
+        // Handle as if we just disconnected
+        HandleSelfDisconnect();
+    }
+
+    /// <summary>
+    /// OnApplicationFocus(false) fires on some platforms where Pause doesn't
+    /// (e.g. PC alt-tab). Treat identically to pause.
+    /// </summary>
+    private void OnApplicationFocus(bool hasFocus)
+    {
+        if (hasFocus || !_watchdogActive) return;
+
+        Debug.Log("[MatchmakingManager] App lost focus — declaring immediate disconnect.");
+        ZeroMyHeartbeat();
+        HandleSelfDisconnect();
+    }
+
+    // ── Firebase ready ────────────────────────────────────────────────────────
+
+    private void OnFirebaseReady() => LoadBotNames();
+
+    // ── Coin deduction tracking ───────────────────────────────────────────────
+
+    private void HandleCoinsDeducted(int amount)
+    {
+        _coinsDeducted = true;
+        Debug.Log("[MatchmakingManager] Coins deducted — disconnect rules changed to win/lose.");
+    }
+
+    // ── Match found — stop matchmaking watchdog, hand off to HostWatchdog ─────
+
+    private void HandleMatchFound(RoomData room)
+    {
+        // Once the game starts, HostWatchdog takes over disconnect detection.
+        // Stop our matchmaking-phase watchdog coroutines but keep _currentRoom
+        // alive so CleanupRoom can still delete it if needed.
+        StopWatchdogCoroutines();
+        _watchdogActive = false;
+        // Do NOT zero _coinsDeducted or _currentRoom here — HostWatchdog needs them.
+    }
+
+    // ─── Start Matchmaking ────────────────────────────────────────────────────
+
+    private void HandleMatchmakingStart(GameModeData mode)
+    {
+        var db = FirebaseManager.DB;
+        if (db == null)
+        {
+            EventManager.FireMatchmakingError("Firebase not ready.");
+            return;
+        }
+
+        _coinsDeducted = false;
+        _disconnectHandled = false;
+
+        string existingRoomId = InviteManager.CurrentRoomId;
+        if (!string.IsNullOrEmpty(existingRoomId))
+        {
+            _isHost = true;
+            _currentRoomId = existingRoomId;
+            _currentRoom = new RoomData
+            {
+                roomId = existingRoomId,
+                hostId = PlayerDataManager.PlayFabId,
+                entryFee = mode != null ? mode.EntryFee : 0,
+                status = "waiting",
+                players = new List<SlotData> { BuildLocalSlot() }
+            };
+            StartMatchmakingWatchdog();
+            StartListening(existingRoomId);
+            _botFillCoroutine = StartCoroutine(BotFillRoutine(existingRoomId));
+            return;
+        }
+
+        db.Collection(RoomsCollection)
+            .WhereEqualTo("status", "waiting")
+            .WhereEqualTo("entryFee", mode.EntryFee)
+            .Limit(1)
+            .GetSnapshotAsync()
+            .ContinueWithOnMainThread(task =>
+            {
+                if (task.IsFaulted || task.IsCanceled)
+                {
+                    EventManager.FireMatchmakingError("Search failed.");
+                    return;
+                }
+
+                QuerySnapshot snap = task.Result;
+                DocumentSnapshot firstDoc = null;
+                if (snap.Count > 0)
+                    foreach (var doc in snap.Documents)
+                    {
+                        firstDoc = doc;
+                        break;
+                    }
+
+                if (firstDoc != null) JoinRoom(firstDoc, mode);
+                else CreateRoom(mode);
+            });
+    }
+
+    // ─── Accept Invite ────────────────────────────────────────────────────────
+
+    private void HandleAcceptInvite(string roomId)
+    {
+        var db = FirebaseManager.DB;
+        if (db == null) return;
+
+        _coinsDeducted = false;
+        _disconnectHandled = false;
+
+        db.Collection(RoomsCollection)
+            .Document(roomId)
+            .GetSnapshotAsync()
+            .ContinueWithOnMainThread(task =>
+            {
+                if (task.IsFaulted || task.IsCanceled || !task.Result.Exists)
+                {
+                    if (GameModeManager.SelectedMode != null)
+                        HandleMatchmakingStart(GameModeManager.SelectedMode);
+                    return;
+                }
+
+                JoinRoom(task.Result, GameModeManager.SelectedMode);
+            });
+    }
+
+    // ─── Create Room ──────────────────────────────────────────────────────────
+
+    private void CreateRoom(GameModeData mode)
+    {
+        _isHost = true;
+        string roomId = Guid.NewGuid().ToString("N");
+        var localPlayer = BuildLocalSlot();
+        long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
+        var roomData = new Dictionary<string, object>
+        {
+            { "hostId", PlayerDataManager.PlayFabId },
+            { "entryFee", mode != null ? mode.EntryFee : 0 },
+            { "status", "waiting" },
+            { "players", new List<object> { SlotToDict(localPlayer) } },
+            { "hostLastSeen", now },
+            {
+                "playerLastSeen", new Dictionary<string, object>
+                    { { PlayerDataManager.PlayFabId, now } }
+            }
+        };
+
+        FirebaseManager.DB.Collection(RoomsCollection)
+            .Document(roomId)
+            .SetAsync(roomData)
+            .ContinueWithOnMainThread(task =>
+            {
+                if (task.IsFaulted)
+                {
+                    EventManager.FireMatchmakingError("Room creation failed.");
+                    return;
+                }
+
+                _currentRoomId = roomId;
+                _currentRoom = new RoomData
+                {
+                    roomId = roomId,
+                    hostId = PlayerDataManager.PlayFabId,
+                    entryFee = mode != null ? mode.EntryFee : 0,
+                    status = "waiting",
+                    players = new List<SlotData> { localPlayer }
+                };
+
+                InviteManager.SetCurrentRoomId(roomId);
+                StartMatchmakingWatchdog();
+                StartListening(roomId);
+                _botFillCoroutine = StartCoroutine(BotFillRoutine(roomId));
+            });
+    }
+
+    // ─── Join Room ────────────────────────────────────────────────────────────
+
+    private void JoinRoom(DocumentSnapshot doc, GameModeData mode)
+    {
+        _isHost = false;
+        string roomId = doc.Id;
+        var localPlayer = BuildLocalSlot();
+        long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
+        FirebaseManager.DB.Collection(RoomsCollection)
+            .Document(roomId)
+            .UpdateAsync(new Dictionary<string, object>
+            {
+                { "players", FieldValue.ArrayUnion(SlotToDict(localPlayer)) },
+                { $"playerLastSeen.{PlayerDataManager.PlayFabId}", now }
+            })
+            .ContinueWithOnMainThread(task =>
+            {
+                if (task.IsFaulted)
+                {
+                    EventManager.FireMatchmakingError("Join failed.");
+                    return;
+                }
+
+                _currentRoomId = roomId;
+                _currentRoom = ParseRoomDoc(doc);
+                if (_currentRoom.players == null) _currentRoom.players = new List<SlotData>();
+                _currentRoom.players.Add(localPlayer);
+
+                InviteManager.SetCurrentRoomId(roomId);
+                StartMatchmakingWatchdog();
+                StartListening(roomId);
+            });
+    }
+
+    // ─── Room Listener ────────────────────────────────────────────────────────
+
+    private void StartListening(string roomId)
+    {
+        _roomListener?.Stop();
+        _roomListener = FirebaseManager.DB.Collection(RoomsCollection)
+            .Document(roomId)
+            .Listen(snapshot =>
+            {
+                if (!snapshot.Exists)
+                {
+                    // Room was deleted externally (another client cleaned it up)
+                    if (_watchdogActive)
+                    {
+                        Debug.Log("[MatchmakingManager] Room deleted externally — reloading scene.");
+                        HandleRoomDeletedExternally();
+                    }
+
+                    return;
+                }
+
+                var room = ParseRoomDoc(snapshot);
+
+                // Host preserves locally-added bots
+                if (_isHost && _currentRoom?.players != null)
+                    foreach (var p in _currentRoom.players)
+                        if (p.isBot && (room.players == null || !room.players.Exists(r => r.id == p.id)))
+                        {
+                            if (room.players == null) room.players = new List<SlotData>();
+                            room.players.Add(p);
+                        }
+
+                _currentRoom = room;
+                EventManager.FireRoomUpdated(room);
+
+                if (_isHost && room.players != null && room.players.Count >= MaxPlayers
+                    && room.status == "waiting")
+                {
+                    // Validate all human players have fresh heartbeats before starting.
+                    // This prevents starting the game with a player who just dropped out
+                    // but whose dropout hasn't been detected by CheckPeers yet.
+                    if (!AllPlayersAlive(snapshot))
+                    {
+                        Debug.LogWarning(
+                            "[MatchmakingManager] Room full but a player heartbeat is stale — not starting yet.");
+                        return;
+                    }
+
+                    SetRoomStatus(roomId, "starting");
+                    StopBotFill();
+                    EventManager.FireMatchFound(room);
+                }
+                else if (!_isHost && room.status == "starting")
+                {
+                    EventManager.FireMatchFound(room);
+                }
+            });
+    }
+
+    // ── Matchmaking Phase Watchdog ─────────────────────────────────────────────
+
+    private void StartMatchmakingWatchdog()
+    {
+        _watchdogActive = true;
+        StopWatchdogCoroutines();
+        _heartbeatCoroutine = StartCoroutine(HeartbeatRoutine());
+        _watchCoroutine = StartCoroutine(PeerWatchRoutine());
+    }
+
+    // Every client refreshes its own heartbeat every 15s
+    private IEnumerator HeartbeatRoutine()
+    {
+        while (_watchdogActive)
+        {
+            yield return new WaitForSeconds(HeartbeatInterval);
+            if (!_watchdogActive) yield break;
+            WriteMyHeartbeat();
+        }
+    }
+
+    private void WriteMyHeartbeat()
+    {
+        if (string.IsNullOrEmpty(_currentRoomId) || FirebaseManager.DB == null) return;
+        string myId = PlayerDataManager.PlayFabId;
+        long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
+        var update = new Dictionary<string, object>
+        {
+            { $"playerLastSeen.{myId}", now }
+        };
+        if (_isHost) update["hostLastSeen"] = now;
+
+        FirebaseManager.DB.Collection(RoomsCollection).Document(_currentRoomId)
+            .UpdateAsync(update);
+    }
+
+    private void ZeroMyHeartbeat()
+    {
+        if (string.IsNullOrEmpty(_currentRoomId) || FirebaseManager.DB == null) return;
+        string myId = PlayerDataManager.PlayFabId;
+
+        var update = new Dictionary<string, object>
+        {
+            { $"playerLastSeen.{myId}", 0L }
+        };
+        if (_isHost) update["hostLastSeen"] = 0L;
+
+        FirebaseManager.DB.Collection(RoomsCollection).Document(_currentRoomId)
+            .UpdateAsync(update);
+    }
+
+    // Polls peers: host checks all non-host players, non-host checks host
+    private IEnumerator PeerWatchRoutine()
+    {
+        yield return new WaitForSeconds(CheckInterval);
+
+        while (_watchdogActive)
+        {
+            CheckPeers();
+            yield return new WaitForSeconds(CheckInterval);
+        }
+    }
+
+    /// <summary>
+    /// Returns true if every human (non-bot) player in the room has a fresh heartbeat.
+    /// Called by the host before firing FireMatchFound to prevent starting a game
+    /// with a player who just dropped out but hasn't been detected by CheckPeers yet.
+    /// </summary>
+    private bool AllPlayersAlive(DocumentSnapshot snapshot)
+    {
+        if (!snapshot.Exists) return false;
+        var dict = snapshot.ToDictionary();
+
+        if (!dict.ContainsKey("playerLastSeen") ||
+            !(dict["playerLastSeen"] is Dictionary<string, object> playerTs))
+            return true; // no heartbeat map yet — allow (early join before first write)
+
+        long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
+        if (_currentRoom?.players == null) return true;
+        foreach (var p in _currentRoom.players)
+        {
+            if (p.isBot) continue;
+            if (!playerTs.ContainsKey(p.id)) continue; // not yet written — allow
+
+            long ts = Convert.ToInt64(playerTs[p.id]);
+            float elapsed = (now - ts) / 1000f;
+
+            if (ts == 0L || elapsed > DisconnectTimeout)
+            {
+                Debug.LogWarning($"[MatchmakingManager] AllPlayersAlive: {p.id} is stale ({elapsed:F0}s).");
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private void CheckPeers()
+    {
+        if (!_watchdogActive || string.IsNullOrEmpty(_currentRoomId)) return;
+
+        FirebaseManager.DB.Collection(RoomsCollection).Document(_currentRoomId)
+            .GetSnapshotAsync()
+            .ContinueWithOnMainThread(task =>
+            {
+                if (!_watchdogActive || task.IsFaulted) return;
+                var snap = task.Result;
+                if (!snap.Exists)
+                {
+                    HandleRoomDeletedExternally();
+                    return;
+                }
+
+                var dict = snap.ToDictionary();
+                long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
+                // Every client checks every other real player's heartbeat.
+                // Non-hosts now also detect when another non-host drops —
+                // not just when the host drops. All clients act independently.
+                if (!dict.ContainsKey("playerLastSeen") ||
+                    !(dict["playerLastSeen"] is Dictionary<string, object> playerTs)) return;
+
+                if (_currentRoom?.players == null) return;
+
+                foreach (var p in _currentRoom.players)
+                {
+                    // Skip bots and self
+                    if (p.isBot || p.id == PlayerDataManager.PlayFabId) continue;
+
+                    if (!playerTs.ContainsKey(p.id)) continue;
+
+                    long ts = Convert.ToInt64(playerTs[p.id]);
+                    float elapsed = (now - ts) / 1000f;
+
+                    if (ts == 0L || elapsed > DisconnectTimeout)
+                    {
+                        Debug.LogWarning($"[MatchmakingManager] Player {p.id} disconnected (elapsed={elapsed:F0}s).");
+                        HandlePeerDisconnect(p.id);
+                        return; // handle one dropout at a time
+                    }
+                }
+            });
+    }
+
+    // ── Disconnect Handlers ───────────────────────────────────────────────────
+
+    /// <summary>
+    /// Called when THIS client disconnects (app paused/backgrounded/locked).
+    /// </summary>
+    private void HandleSelfDisconnect()
+    {
+        if (_disconnectHandled) return;
+        _disconnectHandled = true;
+        _watchdogActive = false;
+        StopWatchdogCoroutines();
+
+        if (!_coinsDeducted)
+        {
+            // Before coins — delete room, reload scene
+            DeleteRoomAndReload();
+        }
+        else
+        {
+            // After coins — we lose. Room cleanup is handled by remaining players.
+            // Just reload our own scene (we go back to home, no WinView for us).
+            _roomListener?.Stop();
+            _roomListener = null;
+            _currentRoomId = null;
+            _currentRoom = null;
+            InviteManager.ClearCurrentRoomId();
+            ReloadScene();
+        }
+    }
+
+    /// <summary>
+    /// Called when a PEER disconnects (detected via heartbeat timeout).
+    /// Every client calls this independently — _disconnectHandled prevents double-fire.
+    /// </summary>
+    private void HandlePeerDisconnect(string disconnectedId)
+    {
+        if (_disconnectHandled) return;
+        _disconnectHandled = true;
+        _watchdogActive = false;
+        StopWatchdogCoroutines();
+
+        if (!_coinsDeducted)
+        {
+            // ── Before coins: delete room, everyone reloads ───────────────────
+            Debug.Log($"[MatchmakingManager] Peer {disconnectedId} left before coins — deleting room.");
+
+            // Every client tries to delete. Firestore ignores duplicate deletes.
+            // This is safe because all clients have detected the dropout via their
+            // own heartbeat poll and will all call DeleteRoomAndReload independently.
+            // The first delete wins; subsequent ones are no-ops on an already-deleted doc.
+            DeleteRoomAndReload();
+        }
+        else
+        {
+            // ── After coins: disconnected player loses, we win ────────────────
+            Debug.Log($"[MatchmakingManager] Peer {disconnectedId} left after coins — declaring result.");
+
+            // Every client independently tries to write the result.
+            // WriteDisconnectResultGuarded reads Firestore first and only writes
+            // if not already finished — prevents double-write from concurrent clients.
+            WriteDisconnectResultGuarded(disconnectedId);
+        }
+    }
+
+    /// <summary>
+    /// Room was deleted by another client. Reload our scene.
+    /// </summary>
+    private void HandleRoomDeletedExternally()
+    {
+        if (_disconnectHandled) return;
+        _disconnectHandled = true;
+        _watchdogActive = false;
+        StopWatchdogCoroutines();
+        _roomListener?.Stop();
+        _roomListener = null;
+        _currentRoomId = null;
+        _currentRoom = null;
+        InviteManager.ClearCurrentRoomId();
+
+        if (_coinsDeducted)
+        {
+            // Room was deleted after coins paid — treat as win for us
+            // (the leaver caused the deletion, they lose)
+            ShowWinViewForDisconnect();
+        }
+        else
+        {
+            ReloadScene();
+        }
+    }
+
+    // ── Write Disconnect Result to Firestore ──────────────────────────────────
+
+    private void WriteDisconnectResult(string loserId)
+    {
+        if (string.IsNullOrEmpty(_currentRoomId) || _currentRoom == null) return;
+
+        var winners = new List<object>();
+        if (_currentRoom.players != null)
+            foreach (var p in _currentRoom.players)
+                if (p.id != loserId)
+                    winners.Add((object)p.id);
+
+        var update = new Dictionary<string, object>
+        {
+            { "gameState.phase", GameState.PhaseFinished },
+            { "gameState.bhabhi", loserId },
+            { "gameState.winners", winners }
+        };
+
+        string roomId = _currentRoomId;
+        FirebaseManager.DB.Collection(RoomsCollection).Document(roomId)
+            .UpdateAsync(update)
+            .ContinueWithOnMainThread(task =>
+            {
+                if (task.IsFaulted)
+                    Debug.LogWarning("[MatchmakingManager] WriteDisconnectResult failed: " + task.Exception?.Message);
+
+                // Show win for everyone still here
+                ShowWinViewForDisconnect();
+            });
+    }
+
+    private void WriteDisconnectResultGuarded(string loserId)
+    {
+        if (string.IsNullOrEmpty(_currentRoomId)) return;
+
+        FirebaseManager.DB.Collection(RoomsCollection).Document(_currentRoomId)
+            .GetSnapshotAsync()
+            .ContinueWithOnMainThread(readTask =>
+            {
+                if (readTask.IsFaulted || !readTask.Result.Exists)
+                {
+                    ShowWinViewForDisconnect();
+                    return;
+                }
+
+                var dict = readTask.Result.ToDictionary();
+                if (dict.ContainsKey("gameState") &&
+                    dict["gameState"] is Dictionary<string, object> gsDict)
+                {
+                    string phase = gsDict.ContainsKey("phase") ? gsDict["phase"].ToString() : "";
+                    if (phase == GameState.PhaseFinished)
+                    {
+                        ShowWinViewForDisconnect();
+                        return;
+                    }
+                }
+
+                WriteDisconnectResult(loserId);
+            });
+    }
+
+    // ── Result Delivery ───────────────────────────────────────────────────────
+
+    private void ShowWinViewForDisconnect()
+    {
+        if (_currentRoom == null)
+        {
+            ReloadScene();
+            return;
+        }
+
+        string roomId = _currentRoomId;
+        int entryFee = _currentRoom.entryFee;
+        int prize = Mathf.RoundToInt(entryFee * 1.25f);
+
+        // Clean up local state before showing WinView
+        StopBotFill();
+        _roomListener?.Stop();
+        _roomListener = null;
+        _currentRoomId = null;
+        _currentRoom = null;
+        _watchdogActive = false;
+        InviteManager.ClearCurrentRoomId();
+
+        // Delete room after a short delay (WinView handles scene reload on claim)
+        StartCoroutine(DeleteRoomAfterDelay(roomId, 3f));
+
+        // Build a minimal winner list containing just the local player so WinView works
+        var winners = new List<string> { PlayerDataManager.PlayFabId };
+        EventManager.FireGameFinished(winners, "disconnected");
+    }
+
+    private void DeleteRoomAndReload()
+    {
+        StopBotFill();
+        _roomListener?.Stop();
+        _roomListener = null;
+
+        string roomId = _currentRoomId;
+        _currentRoomId = null;
+        _currentRoom = null;
+        _watchdogActive = false;
+        InviteManager.ClearCurrentRoomId();
+
+        if (!string.IsNullOrEmpty(roomId) && FirebaseManager.DB != null)
+        {
+            FirebaseManager.DB.Collection(RoomsCollection).Document(roomId)
+                .DeleteAsync()
+                .ContinueWithOnMainThread(_ => ReloadScene());
+        }
+        else
+        {
+            ReloadScene();
+        }
+    }
+
+    private IEnumerator DeleteRoomAfterDelay(string roomId, float delay)
+    {
+        yield return new WaitForSeconds(delay);
+        if (!string.IsNullOrEmpty(roomId) && FirebaseManager.DB != null)
+            FirebaseManager.DB.Collection(RoomsCollection).Document(roomId).DeleteAsync();
+    }
+
+    private void ReloadScene()
+    {
+        Debug.Log("[MatchmakingManager] Reloading scene.");
+        SceneManager.LoadScene(SceneManager.GetActiveScene().buildIndex);
+    }
+
+    // ─── Bot Fill ─────────────────────────────────────────────────────────────
+
+    private IEnumerator BotFillRoutine(string roomId)
+    {
+        yield return new WaitForSeconds(Random.Range(BotFillDelayMin, BotFillDelayMax));
+
+        while (_currentRoom != null &&
+               (_currentRoom.players == null || _currentRoom.players.Count < MaxPlayers))
+        {
+            var bot = CreateBotSlot();
+            if (_currentRoom.players == null) _currentRoom.players = new List<SlotData>();
+            _currentRoom.players.Add(bot);
+
+            FirebaseManager.DB.Collection(RoomsCollection).Document(roomId)
+                .UpdateAsync(new Dictionary<string, object>
+                {
+                    { "players", FieldValue.ArrayUnion(SlotToDict(bot)) }
+                });
+
+            yield return new WaitForSeconds(Random.Range(BotFillDelayMin, BotFillDelayMax));
+        }
+    }
+
+    // ─── Create Room For Invite ───────────────────────────────────────────────
+
+    public static async Task<bool> CreateRoomAsync()
+    {
+        var db = FirebaseManager.DB;
+        if (db == null)
+        {
+            Debug.LogWarning("[MatchmakingManager] Firebase not ready.");
+            return false;
+        }
+
+        try
+        {
+            string roomId = Guid.NewGuid().ToString("N");
+            int entryFee = GameModeManager.SelectedMode != null ? GameModeManager.SelectedMode.EntryFee : 0;
+            long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
+            var roomData = new Dictionary<string, object>
+            {
+                { "hostId", PlayerDataManager.PlayFabId },
+                { "entryFee", entryFee },
+                { "status", "waiting" },
+                {
+                    "players", new List<object>
+                    {
+                        new Dictionary<string, object>
+                        {
+                            { "id", PlayerDataManager.PlayFabId }, { "displayName", PlayerDataManager.DisplayName },
+                            { "avatarIndex", PlayerDataManager.AvatarIndex }, { "isBot", false }
+                        }
+                    }
+                },
+                { "hostLastSeen", now },
+                { "playerLastSeen", new Dictionary<string, object> { { PlayerDataManager.PlayFabId, now } } }
+            };
+
+            DocumentReference docRef = db.Collection(RoomsCollection).Document(roomId);
+            await docRef.SetAsync(roomData);
+
+            DocumentSnapshot snapshot = null;
+            for (int i = 0; i < 3; i++)
+            {
+                snapshot = await docRef.GetSnapshotAsync();
+                if (snapshot.Exists) break;
+                await Task.Delay(500);
+            }
+
+            if (snapshot == null || !snapshot.Exists)
+            {
+                Debug.LogWarning("[MatchmakingManager] Room write could not be verified.");
+                return false;
+            }
+
+            InviteManager.SetCurrentRoomId(roomId);
+            Debug.Log("[MatchmakingManager] Room pre-created: " + roomId);
+            return true;
+        }
+        catch (Exception e)
+        {
+            Debug.LogWarning("[MatchmakingManager] CreateRoomAsync failed: " + e.Message);
+            return false;
+        }
+    }
+
+    // ─── Leave / Cancel ───────────────────────────────────────────────────────
+
+    private void HandleMatchmakingCancel() => CleanupRoom();
+    private void HandleLeaveRoom() => CleanupRoom();
+
+    private void CleanupRoom()
+    {
+        _watchdogActive = false;
+        _disconnectHandled = false;
+        _coinsDeducted = false;
+        StopBotFill();
+        StopWatchdogCoroutines();
+        _roomListener?.Stop();
+        _roomListener = null;
+
+        if (_currentRoom != null && _isHost && FirebaseManager.DB != null)
+            FirebaseManager.DB.Collection(RoomsCollection).Document(_currentRoom.roomId).DeleteAsync();
+
+        InviteManager.ClearCurrentRoomId();
+        _currentRoomId = null;
+        _currentRoom = null;
+        _isHost = false;
+        EventManager.FireRoomLeft();
+    }
+
+    // ─── Helpers ─────────────────────────────────────────────────────────────
+
+    private void SetRoomStatus(string roomId, string status)
+    {
+        FirebaseManager.DB.Collection(RoomsCollection).Document(roomId)
+            .UpdateAsync(new Dictionary<string, object> { { "status", status } });
+    }
+
+    public RoomData GetCurrentRoom() => _currentRoom;
+
+    private void StopWatchdogCoroutines()
+    {
+        if (_heartbeatCoroutine != null)
+        {
+            StopCoroutine(_heartbeatCoroutine);
+            _heartbeatCoroutine = null;
+        }
+
+        if (_watchCoroutine != null)
+        {
+            StopCoroutine(_watchCoroutine);
+            _watchCoroutine = null;
+        }
+    }
+
+    private void StopBotFill()
+    {
+        if (_botFillCoroutine != null)
+        {
+            StopCoroutine(_botFillCoroutine);
+            _botFillCoroutine = null;
+        }
+    }
+
+    private SlotData BuildLocalSlot() => new SlotData
+    {
+        id = PlayerDataManager.PlayFabId,
+        displayName = PlayerDataManager.DisplayName,
+        avatarIndex = PlayerDataManager.AvatarIndex,
+        isBot = false
+    };
+
+    private Dictionary<string, object> SlotToDict(SlotData s) => new Dictionary<string, object>
+    {
+        { "id", s.id }, { "displayName", s.displayName },
+        { "avatarIndex", s.avatarIndex }, { "isBot", s.isBot }
+    };
+
+    private RoomData ParseRoomDoc(DocumentSnapshot doc)
+    {
+        var room = new RoomData { roomId = doc.Id, players = new List<SlotData>() };
+        if (doc.TryGetValue("hostId", out string hostId)) room.hostId = hostId;
+        if (doc.TryGetValue("entryFee", out int fee)) room.entryFee = fee;
+        if (doc.TryGetValue("status", out string status)) room.status = status;
+
+        if (doc.TryGetValue("players", out List<object> players))
+            foreach (var p in players)
+                if (p is Dictionary<string, object> pd)
+                    room.players.Add(new SlotData
+                    {
+                        id = pd.TryGetValue("id", out var id) ? id.ToString() : "",
+                        displayName = pd.TryGetValue("displayName", out var dn) ? dn.ToString() : "Player",
+                        avatarIndex = pd.TryGetValue("avatarIndex", out var ai) ? Convert.ToInt32(ai) : 0,
+                        isBot = pd.TryGetValue("isBot", out var ib) && Convert.ToBoolean(ib)
+                    });
+        return room;
+    }
+
+    // ── Bot name pool ─────────────────────────────────────────────────────────
+
+    private SlotData CreateBotSlot()
+    {
+        _botCounter++;
+        return new SlotData
+        {
+            id = "BOT_" + _botCounter,
+            displayName = PickUniqueBotName(),
+            avatarIndex = UnityEngine.Random.Range(0, 16),
+            isBot = true
+        };
+    }
+
+    private string PickUniqueBotName()
+    {
+        if (_botNames == null || _botNames.Length == 0) return "Bot" + _botCounter;
+
+        var usedNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (_currentRoom?.players != null)
+            foreach (var p in _currentRoom.players)
+                usedNames.Add(p.displayName);
+
+        int attempts = 0;
+        while (attempts < _botNames.Length)
+        {
+            string candidate = _botNames[_botNameIndex % _botNames.Length];
+            _botNameIndex++;
+            if (!usedNames.Contains(candidate)) return candidate;
+            attempts++;
+        }
+
+        return _botNames[_botCounter % _botNames.Length] + "_" + _botCounter;
     }
 
     private void LoadBotNames()
@@ -89,512 +997,11 @@ public class MatchmakingManager : MonoBehaviour
 
     private string[] DefaultBotNames() => new[]
     {
-        "Iqra", "Nusha", "Iffat", "Mujtaba", "Danish", "Usman", "Shaista", "Roohi", "Ghazal", "Taimoor",
-        "Nimra", "Saira", "Kanza", "Waleed", "Maha", "Shazia", "Hadi", "Muneeb", "Kabir", "Rubab",
-        "Hamza", "Fareeha", "Naveed", "Laila", "Rashid", "Amna", "Asif", "Haris", "Khalid", "Fahd",
-        "Yasir", "Imran", "Shahzad", "Raheel", "Bushra", "Kamran", "Fozia", "Huma", "Qasim", "Arman",
-        "Mehwish", "Zunaira", "Hashim", "Farah", "Majid", "Munir", "Tanveer", "Zahir", "Khadija", "Masood",
-        "Junaid", "Ayesha", "Amina", "Zeeshan", "Ali", "Fahim", "Ahsan", "Sadia", "Hina", "Shayan",
-        "Yusra", "Rehan", "Shahjahan", "Nargis", "Zubair", "Shabbir", "Mahnoor", "Zohair", "Raheel", "Imtiaz",
-        "Uzma", "Fatima", "Erum", "Shahid", "Noor", "Hassan", "Irshad", "Lubna", "Rashida", "Sharjeel",
-        "Mahwish", "AyeshaKhan", "Shamim", "Yasmin", "Abid", "Abubakar", "Sabir", "Tariq", "Nadia", "Bushra",
-        "SyedZafar", "Aleena", "Tariq", "Marium", "Noman", "Alia", "Sakina", "Aqsa", "Nazar", "Zara",
-        "Momin", "Humayun", "Shiza", "Mahira", "Rayaan", "Tuba", "Ayat", "Ali1", "Marwa", "Dilawar",
-        "Hussain", "Sheraz", "Kiran", "Younis", "Nida", "Kanwal", "Rafay", "Sidra", "Farooq", "Kashif",
-        "Javeria", "AliFatima", "Salman", "Farhan", "Safia", "Wasiq", "Naila", "Mumtaz", "Khadim", "Nazish",
-        "Sanam", "Qaiser", "Komal", "Noman1997", "Sachal", "SidraNaeem", "Karishma", "Azeem", "Rameez", "Shiraz",
-        "Tanzeel", "Sumaira", "Rahim", "Areesha", "Shazia1991", "Eman", "Ubaid", "Areej", "Imtisal", "Hifza",
-        "Irfan", "Kamil", "Shahzad15", "Amal", "Abdul", "Anwar", "HassanOP", "Arsalan", "Maliha", "Nadeem",
-        "Mahum", "Alee", "Noreen", "Mufaddal", "Nusrat", "Naseem", "Raheela", "Aleem", "Hania", "Zehra",
-        "Yasir", "Fareeda", "Amna", "Fayyaz", "ShaziaOP", "Shakeel", "Mahrukh", "ShahidOP", "Hamid", "Afaq",
-        "AbdulKarim", "Noman_Fahad", "Mustafa", "Munawar", "Yusra", "Kashif", "KashifLive", "Nishat", "KamranOP",
-        "ShaziaOP", "Aftab", "UsmanLive", "Rahat", "Sara", "AhmedOP", "Hajra", "Hasnat", "Hafsa", "Mona",
-        "KashifLive", "Noor", "Ghazanfar", "Nayab", "Ishraq", "JamalLive", "Imad", "Ghous", "Nihar", "OsmanLive",
-        "Qadeer", "Nawal", "Mehar", "YasirOP", "Shafqat", "Hina", "AshfaqLive", "Shabaz", "Owais", "Rashid",
-        "Dania", "AshfaqPro", "Luqman", "Qaisar", "Ruqaiya", "MaazOP", "Atif", "Nazli", "AnasLive", "Tashfeen",
-        "MalikOP", "Gulzar", "Faisal", "JaveriaLive", "Maryam", "Karam", "Masood", "Haris", "AdilOP", "Shehla",
-        "Parveen", "Fahad", "Muzna", "RaheelOP", "Shaista", "IhsanLive", "Bushra", "Adeeb", "Ranya", "ShahidOP",
-        "Sadiq", "Sabahat", "Laraib", "Sarfaraz", "HaniaLive", "Hamza", "Azfar", "RashidOP", "AdnanOP", "Rabia",
-        "AyubLive", "Suleman", "Tariq", "Subhan", "Nighat", "BilalOP", "AslamLive", "Rana", "Waseem", "NoreenLive",
-        "Muniba", "Farida", "NawabOP", "Nazim", "Fawad", "MahumOP", "Sikandar", "ImranLive", "Fiza", "JamshedOP",
-        "Shahbaz", "Muniza", "TahirLive", "AshfaqOP", "AdeelOP", "Sadia", "FarhanLive", "BushraOP", "MahnoorLive",
-        "Johar", "Talha", "AzamOP", "Shraddha", "ZainLive", "Huma", "AshrafLive", "Ayesha", "KiranLive", "Munawar",
-        "RabiaLive", "Adil", "Kimya", "AmirLive", "Shazia", "KamranLive", "TashfeenOP", "AymanOP", "Sabir", "HiraOP",
-        "Shanzeela", "Madiha", "FaisalLive", "SaqlainOP", "FaisalOP", "HamzaLive", "SabirOP", "AyeshaOP", "ImranOP",
-        "AqsaLive", "Ayman", "AshrafOP", "SajidLive", "SabirLive", "Hassaan", "FawadLive", "FawadOP", "BasitLive",
-        "Farhaan", "MahwishLive", "ZainOP", "RizwanLive", "RizwanOP", "AliGW", "Zainalabdin", "BasitOP", "Nomi",
-        "Mehak", "HammadOP", "FahadLive", "JaveriaOP", "SairaLive", "Neha", "Hamza99", "SunilLive", "SundasOP",
-        "ImadLive", "SadiaOP", "NusratLive", "Imran786", "YousafLive", "MuneebOP", "Aman", "ReemaOP", "SameerLive",
-        "HajraLive", "Saif786", "HumairaLive", "Sara", "WaqasLive", "AnwarOP", "MalihaLive", "Raheel786", "JunaidLive",
-        "Ayesha786", "RaimaLive", "Shazia786", "SabahatLive", "Nabeel786", "HinaLive", "Shaista786", "MalikLive",
-        "Omer786", "LaibaLive", "Shahid786", "SyedaLive", "Talha786", "NaginaLive", "Omer99", "Junaid786", "RehanLive",
-        "Fatima786", "Sana786", "Rabia786", "Amal786", "Waseem786", "Salman786", "TalhaLive", "Uzair786", "Yasir786",
-        "Alina786", "Zainab786", "YasirLive", "Adil786", "Areeba786", "Haroon786", "Nimra786", "Amir786", "Kashif786",
-        "Sikandar786", "RabiaLive", "Ashfaq786", "Rabia99", "Zoya786", "Sakib786", "Yasir99", "Afzal786", "Saif99",
-        "Daniyal786", "Amjad786", "Madiha786", "Adil99", "Misha786", "Faisal99", "Shahzaib786", "Arsal786", "Rida786",
-        "Saadia786", "Tamanna786", "Fareeha786", "Uzma786", "Yasir777", "Tamanna777", "Mehwish777", "Hana777",
-        "Huma777",
-        "Umair77", "Saif77", "Maya77", "Fahad77", "Zahida77", "Shahid77", "Pankaj77", "Iffat77", "Nawal77", "Dilbar77",
-        "Zeeshan77", "Huma77", "Shazia77", "Kashif77", "Uzma77", "Faizan77", "Samina77", "Waseem77", "Shabina77",
-        "Taimoor77",
-        "Sundus77", "Hassan77", "Ubaid77", "Noor77", "Hareem77", "Maira77", "Rimsha77", "Atif77", "Ayesha77",
-        "Shamshad77",
-        "Shabnam77", "Shahbaz77", "Sakina77", "Imad77", "Nabeel77", "Adeel77", "Nisha77", "Sidra77", "Nida77", "Shan47",
-        "Qasim47", "Hina47", "Feroza47", "Amar47", "Amna47", "Fahad47", "Noreen47", "Sara47", "Tamanna47", "Hasan47",
-        "Hafeez47", "Noman47", "Aamina47", "Amal47", "Sarwar47", "Iqra47", "Babar47", "Shahbaz47", "Faisal47", "Rida47",
-        "Asif47", "Salman47", "Masood47", "Ayesha47", "Hafsa47", "Shehzad47", "Afan47", "Naila47", "Ishaq47",
-        "Mahwish47",
-        "Naila77", "Aqsa47", "Shanzeela47", "Rashida47", "Nadia47", "Laraib47", "Ayesha47", "Zunaira47", "Reema47",
-        "Sarah47",
-        "Naima47", "Sadia47", "Sania47", "Alia47", "Raneem47", "Usha47", "Maliha47", "Nabeel47", "Sumaira47",
-        "Haleema47",
-        "Amara47", "Kausar47", "Nazrat47", "Komal47", "Baljeet47", "Rafia47", "Mustafa47", "Anum47", "Nimra47",
-        "Shuma48",
-        "Iqra48", "Sara48", "Humaira48", "Nadia48", "Ayesha48", "Munir48", "Imran48", "Hania48", "Rizwana48", "Uzma48",
-        "Rukhsana48", "Sumayya48", "Hiba48", "Rahim48", "Ambreen48", "Haniya48", "Samina48", "Nehal48", "Shifa48",
-        "Sanam48",
-        "Zunaira48", "Ameen49", "Sabeen49", "Sara49", "Bariha49", "Asifa49", "Uzma49", "Naheed49", "Atif49", "Maha49",
-        "Haq49", "Zulekha49", "Wahab49", "Khalid49", "Qaiser49", "Munaza49", "Aliya49", "Iqra49", "Aqsa49", "Mehreen49",
-        "Manahil49", "Zara49", "Shabana49", "Fizza49", "Karishma49", "Afshan49", "Farheen49", "Uzo49", "Zaara49",
-        "Rehmat49",
-        "Zahra49", "Khurram49", "Romee49", "Hira49", "Naiza49", "Farzana49", "Quadri49", "Ilma49", "Atiqa49", "Sabah49",
-        "Iqra49", "Laila49", "Zainab49", "Anam49", "Fizza49", "Haniya49", "Iqra49", "Shaheen49", "Shiza49", "Salma49",
-        "Talha49", "Sadia49", "Ayesha49", "Zuhoor49", "Shehnaz49", "Hania49", "Kainat49", "Zoya49", "Ali50", "Alee50",
-        "Babar50", "Wasiq50", "Hadi50", "Ali50", "Bilal50", "Mona50", "Hassan50", "XxKhan", "ProAhmed", "WolfFatima",
-        "LiveAyesha", "YTHamza", "DrAli", "KingSara", "QueenZara", "OPUsman", "GodBilal", "MasterHassan",
-        "SniperFatima", "TigerAyesha",
-        "DragonHamza", "NinjaAli", "GhostSara", "LegendZara", "HeroUsman", "AngelBilal", "WolfHamzaX", "TigerBilalX",
-        "DragonAliX", "Xx_Fatima",
-        "Ali_Gamer", "Bilal_007", "Hassan_77", "Fatima_47", "Ayesha_88", "Hamza_99", "RealAli", "RealAhmed", "OpenSara",
-        "KnightZara",
-        "ShadowUsman", "GhostBilal", "KnightHassan", "RiderFatima", "DragonAyesha", "GamerHamza", "ZaraOP", "AliTube",
-        "AhmedPlay", "SaraNoFear",
-        "ProZara", "CaptainUsman", "AceBilal", "SniperHassan", "NinjaFatima", "SamuraiAyesha", "FalconHamza",
-        "PelicanAli", "HawkAhmed", "WolfSara",
-        "TigerZara", "EagleUsman", "ScorpionBilal", "GhostHassan", "MidnightFatima", "BlackAyesha", "PhantomHamza",
-        "SpartaAli", "GODAhmed", "YTalaib",
-        "QamarX", "GamzaX", "FoxyYasir", "WolfZaan", "TigerFahad", "NinjaAisha", "ViperAyesha", "HawkZara", "AlphaAli",
-        "OmegaSara", "ZunamiAli", "Zearah786",
-        "CobraBilal", "TalonFatima", "HussainX", "MalikX", "XYZ", "Ali11", "AzraX", "YasirOPX", "UltraSara",
-        "KnightHamzaOP", "ShayanGOD", "BetaAyesha", "AqeelPro",
-        "Nemo23", "Zoltar", "RogueAli", "AgentAyesha", "MaxUsman", "BetaSara", "BladeZara", "SuperFatima",
-        "GamerHassan", "XAliX", "Bobustudio", "Aman47", "XYZ123",
-        "NickName", "Ali42", "Hamza42", "Rashid42", "Hassan42", "YaAli", "Tauqeer", "UniversalAli", "TerrorAyesha",
-        "ZombieFatima", "AlphaHassan", "CandyHamza", "007Bilal"
+        "Iqra", "Nusha", "Iffat", "Mujtaba", "Danish", "Usman", "Shaista", "Roohi",
+        "Ghazal", "Taimoor", "Nimra", "Saira", "Kanza", "Waleed", "Maha", "Shazia",
+        "Hadi", "Muneeb", "Kabir", "Rubab", "Hamza", "Fareeha", "Naveed", "Laila",
+        "Rashid", "Amna", "Asif", "Haris", "Khalid", "Fahd"
     };
-
-
-    // ─── Start Matchmaking ───────────────────────────────────────────────────
-
-    // ─── Start Matchmaking ───────────────────────────────────────────────────
-    private void HandleMatchmakingStart(GameModeData mode)
-    {
-        var db = FirebaseManager.DB;
-        if (db == null)
-        {
-            EventManager.FireMatchmakingError("Firebase not ready.");
-            return;
-        }
-
-        // If room was pre-created via invite flow, reuse it instead of searching
-        string existingRoomId = InviteManager.CurrentRoomId;
-        if (!string.IsNullOrEmpty(existingRoomId))
-        {
-            _isHost = true;
-            _currentRoom = new RoomData
-            {
-                roomId   = existingRoomId,
-                hostId   = PlayerDataManager.PlayFabId,
-                entryFee = mode != null ? mode.EntryFee : 0,
-                status   = "waiting",
-                players  = new List<SlotData> { BuildLocalSlot() }
-            };
-            StartListening(existingRoomId);
-            _botFillCoroutine = StartCoroutine(BotFillRoutine(existingRoomId));
-            return;
-        }
-
-        // Normal matchmaking — search for existing room
-        db.Collection(RoomsCollection)
-            .WhereEqualTo("status", "waiting")
-            .WhereEqualTo("entryFee", mode.EntryFee)
-            .Limit(1)
-            .GetSnapshotAsync()
-            .ContinueWithOnMainThread(task =>
-            {
-                if (task.IsFaulted || task.IsCanceled)
-                {
-                    EventManager.FireMatchmakingError("Search failed.");
-                    return;
-                }
-
-                QuerySnapshot snap = task.Result;
-                if (snap.Count > 0)
-                {
-                    DocumentSnapshot firstDoc = null;
-                    foreach (var doc in snap.Documents)
-                    {
-                        firstDoc = doc;
-                        break;
-                    }
-
-                    if (firstDoc != null)
-                        JoinRoom(firstDoc, mode);
-                    else
-                        CreateRoom(mode);
-                }
-                else
-                {
-                    CreateRoom(mode);
-                }
-            });
-    }
-
-    // ─── Accept Invite ────────────────────────────────────────────────────────
-
-    private void HandleAcceptInvite(string roomId)
-    {
-        var db = FirebaseManager.DB;
-        if (db == null) return;
-
-        db.Collection(RoomsCollection)
-            .Document(roomId)
-            .GetSnapshotAsync()
-            .ContinueWithOnMainThread(task =>
-            {
-                if (task.IsFaulted || task.IsCanceled || !task.Result.Exists)
-                {
-                    // Room gone — start own matchmaking
-                    if (GameModeManager.SelectedMode != null)
-                        HandleMatchmakingStart(GameModeManager.SelectedMode);
-                    return;
-                }
-
-                JoinRoom(task.Result, GameModeManager.SelectedMode);
-            });
-    }
-
-    // ─── Create Room ──────────────────────────────────────────────────────────
-
-    private void CreateRoom(GameModeData mode)
-    {
-        _isHost = true;
-        string roomId = Guid.NewGuid().ToString("N");
-        var localPlayer = BuildLocalSlot();
-
-        var roomData = new Dictionary<string, object>
-        {
-            { "hostId", PlayerDataManager.PlayFabId },
-            { "entryFee", mode != null ? mode.EntryFee : 0 },
-            { "status", "waiting" },
-            { "players", new List<object> { SlotToDict(localPlayer) } },
-            { "hostLastSeen", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() }
-        };
-
-        FirebaseManager.DB.Collection(RoomsCollection)
-            .Document(roomId)
-            .SetAsync(roomData)
-            .ContinueWithOnMainThread(task =>
-            {
-                if (task.IsFaulted)
-                {
-                    EventManager.FireMatchmakingError("Room creation failed.");
-                    return;
-                }
-
-                _currentRoom = new RoomData
-                {
-                    roomId = roomId,
-                    hostId = PlayerDataManager.PlayFabId,
-                    entryFee = mode != null ? mode.EntryFee : 0,
-                    status = "waiting",
-                    players = new List<SlotData> { localPlayer }
-                };
-
-                InviteManager.SetCurrentRoomId(roomId);
-                StartListening(roomId);
-                _botFillCoroutine = StartCoroutine(BotFillRoutine(roomId));
-            });
-    }
-
-    // ─── Join Room ────────────────────────────────────────────────────────────
-
-    private void JoinRoom(DocumentSnapshot doc, GameModeData mode)
-    {
-        _isHost = false;
-        string roomId = doc.Id;
-        var localPlayer = BuildLocalSlot();
-
-        FirebaseManager.DB.Collection(RoomsCollection)
-            .Document(roomId)
-            .UpdateAsync(new Dictionary<string, object>
-            {
-                { "players", FieldValue.ArrayUnion(SlotToDict(localPlayer)) }
-            })
-            .ContinueWithOnMainThread(task =>
-            {
-                if (task.IsFaulted)
-                {
-                    EventManager.FireMatchmakingError("Join failed.");
-                    return;
-                }
-
-                _currentRoom = ParseRoomDoc(doc);
-                if (_currentRoom.players == null) _currentRoom.players = new List<SlotData>();
-                _currentRoom.players.Add(localPlayer);
-
-                InviteManager.SetCurrentRoomId(roomId);
-                StartListening(roomId);
-            });
-    }
-
-    // ─── Listener ────────────────────────────────────────────────────────────
-
-    private void StartListening(string roomId)
-    {
-        _roomListener?.Stop();
-        _roomListener = FirebaseManager.DB.Collection(RoomsCollection)
-            .Document(roomId)
-            .Listen(snapshot =>
-            {
-                if (!snapshot.Exists) return;
-
-                var room = ParseRoomDoc(snapshot);
-
-                // Host preserves locally-added bots
-                if (_isHost && _currentRoom?.players != null)
-                {
-                    foreach (var p in _currentRoom.players)
-                    {
-                        if (p.isBot && (room.players == null || !room.players.Exists(r => r.id == p.id)))
-                        {
-                            if (room.players == null) room.players = new List<SlotData>();
-                            room.players.Add(p);
-                        }
-                    }
-                }
-
-                _currentRoom = room;
-                EventManager.FireRoomUpdated(room);
-
-                if (_isHost && room.players != null && room.players.Count >= MaxPlayers &&
-                    room.status == "waiting")
-                {
-                    SetRoomStatus(roomId, "starting");
-                    StopBotFill();
-                    EventManager.FireMatchFound(room);
-                }
-                else if (!_isHost && room.status == "starting")
-                {
-                    EventManager.FireMatchFound(room);
-                }
-            });
-    }
-
-    // ─── Bot Fill ─────────────────────────────────────────────────────────────
-
-    private IEnumerator BotFillRoutine(string roomId)
-    {
-        yield return new WaitForSeconds(BotFillInterval);
-
-        while (_currentRoom != null &&
-               (_currentRoom.players == null || _currentRoom.players.Count < MaxPlayers))
-        {
-            var bot = CreateBotSlot();
-            if (_currentRoom.players == null) _currentRoom.players = new List<SlotData>();
-            _currentRoom.players.Add(bot);
-
-            FirebaseManager.DB.Collection(RoomsCollection)
-                .Document(roomId)
-                .UpdateAsync(new Dictionary<string, object>
-                {
-                    { "players", FieldValue.ArrayUnion(SlotToDict(bot)) }
-                });
-
-            yield return new WaitForSeconds(BotFillInterval);
-        }
-    }
-
-    // ─── Create Room For Invite (called before matchmaking starts) ────────────
-    public static async Task<bool> CreateRoomAsync()
-    {
-        var db = FirebaseManager.DB;
-        if (db == null)
-        {
-            Debug.LogWarning("[MatchmakingManager] Firebase not ready for CreateRoomAsync.");
-            return false;
-        }
-
-        try
-        {
-            string roomId = Guid.NewGuid().ToString("N");
-            int entryFee = GameModeManager.SelectedMode != null ? GameModeManager.SelectedMode.EntryFee : 0;
-
-            var roomData = new Dictionary<string, object>
-            {
-                { "hostId", PlayerDataManager.PlayFabId },
-                { "entryFee", entryFee },
-                { "status", "waiting" },
-                {
-                    "players", new List<object>
-                    {
-                        new Dictionary<string, object>
-                        {
-                            { "id", PlayerDataManager.PlayFabId },
-                            { "displayName", PlayerDataManager.DisplayName },
-                            { "avatarIndex", PlayerDataManager.AvatarIndex },
-                            { "isBot", false }
-                        }
-                    }
-                },
-                { "hostLastSeen", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() }
-            };
-
-            DocumentReference docRef = db.Collection(RoomsCollection).Document(roomId);
-
-            // Step 1: Write room
-            await docRef.SetAsync(roomData);
-
-            // Step 2: Verify room exists — retry up to 3 times
-            DocumentSnapshot snapshot = null;
-            for (int i = 0; i < 3; i++)
-            {
-                snapshot = await docRef.GetSnapshotAsync(); // correct SDK method
-                if (snapshot.Exists) break;
-                await Task.Delay(500);
-            }
-
-            if (snapshot == null || !snapshot.Exists)
-            {
-                Debug.LogWarning("[MatchmakingManager] Room write could not be verified in Firestore.");
-                return false;
-            }
-
-            InviteManager.SetCurrentRoomId(roomId);
-            Debug.Log("[MatchmakingManager] Room pre-created and verified: " + roomId);
-            return true;
-        }
-        catch (Exception e)
-        {
-            Debug.LogWarning("[MatchmakingManager] CreateRoomAsync failed: " + e.Message);
-            return false;
-        }
-    }
-
-    private SlotData CreateBotSlot()
-    {
-        _botCounter++;
-        string name = PickUniqueBotName();
-        return new SlotData
-        {
-            id = "BOT_" + _botCounter,
-            displayName = name,
-            avatarIndex = UnityEngine.Random.Range(0, 16),
-            isBot = true
-        };
-    }
-
-    private string PickUniqueBotName()
-    {
-        if (_botNames == null || _botNames.Length == 0) return "Bot" + _botCounter;
-
-        var usedNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        if (_currentRoom?.players != null)
-            foreach (var p in _currentRoom.players)
-                usedNames.Add(p.displayName);
-
-        int attempts = 0;
-        while (attempts < _botNames.Length)
-        {
-            string candidate = _botNames[_botNameIndex % _botNames.Length];
-            _botNameIndex++;
-            if (!usedNames.Contains(candidate))
-                return candidate;
-            attempts++;
-        }
-
-        return _botNames[_botCounter % _botNames.Length] + "_" + _botCounter;
-    }
-
-    private void StopBotFill()
-    {
-        if (_botFillCoroutine != null)
-        {
-            StopCoroutine(_botFillCoroutine);
-            _botFillCoroutine = null;
-        }
-    }
-
-    // ─── Leave / Cancel ───────────────────────────────────────────────────────
-
-    private void HandleMatchmakingCancel() => CleanupRoom();
-    private void HandleLeaveRoom() => CleanupRoom();
-
-    private void CleanupRoom()
-    {
-        StopBotFill();
-        _roomListener?.Stop();
-        _roomListener = null;
-
-        if (_currentRoom != null && _isHost && FirebaseManager.DB != null)
-            FirebaseManager.DB.Collection(RoomsCollection).Document(_currentRoom.roomId).DeleteAsync();
-
-        InviteManager.ClearCurrentRoomId();
-        _currentRoom = null;
-        _isHost = false;
-        EventManager.FireRoomLeft();
-    }
-
-    private void SetRoomStatus(string roomId, string status)
-    {
-        FirebaseManager.DB.Collection(RoomsCollection).Document(roomId)
-            .UpdateAsync(new Dictionary<string, object> { { "status", status } });
-    }
-
-    public RoomData GetCurrentRoom() => _currentRoom;
-
-    // ─── Helpers ─────────────────────────────────────────────────────────────
-
-    private SlotData BuildLocalSlot() => new SlotData
-    {
-        id = PlayerDataManager.PlayFabId,
-        displayName = PlayerDataManager.DisplayName,
-        avatarIndex = PlayerDataManager.AvatarIndex,
-        isBot = false
-    };
-
-    private Dictionary<string, object> SlotToDict(SlotData s) => new Dictionary<string, object>
-    {
-        { "id", s.id }, { "displayName", s.displayName },
-        { "avatarIndex", s.avatarIndex }, { "isBot", s.isBot }
-    };
-
-    private RoomData ParseRoomDoc(DocumentSnapshot doc)
-    {
-        var room = new RoomData { roomId = doc.Id, players = new List<SlotData>() };
-        if (doc.TryGetValue("hostId", out string hostId)) room.hostId = hostId;
-        if (doc.TryGetValue("entryFee", out int fee)) room.entryFee = fee;
-        if (doc.TryGetValue("status", out string status)) room.status = status;
-
-        if (doc.TryGetValue("players", out List<object> players))
-        {
-            foreach (var p in players)
-            {
-                if (p is Dictionary<string, object> pd)
-                {
-                    room.players.Add(new SlotData
-                    {
-                        id = pd.TryGetValue("id", out var id) ? id.ToString() : "",
-                        displayName = pd.TryGetValue("displayName", out var dn) ? dn.ToString() : "Player",
-                        avatarIndex = pd.TryGetValue("avatarIndex", out var ai) ? Convert.ToInt32(ai) : 0,
-                        isBot = pd.TryGetValue("isBot", out var ib) && Convert.ToBoolean(ib)
-                    });
-                }
-            }
-        }
-
-        return room;
-    }
 
     [Serializable]
     private class BotNamesWrapper

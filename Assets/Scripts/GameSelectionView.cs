@@ -103,6 +103,10 @@ public class GameSelectionView : MonoBehaviour
 
     // ── Event Handlers ────────────────────────────────────────────────────────
 
+    public const string ModeSelectKey = "HomePageModeSelect";
+    public const string ModeClassic = "Classic";
+    public const string ModeFriends = "Friends";
+
     private void HandleGameModeSelected(GameModeData modeData)
     {
         EventManager.FireGetCoinsRequested(coins =>
@@ -118,7 +122,10 @@ public class GameSelectionView : MonoBehaviour
 
             // ← These two were outside the callback before — that was a bug
             GameModeManager.SetSelectedMode(modeData);
-            EventManager.FireShowView(ViewType.Matchmaking);
+            if (PlayerPrefs.GetString(ModeSelectKey) == ModeClassic)
+                EventManager.FireShowView(ViewType.Matchmaking);
+            if (PlayerPrefs.GetString(ModeSelectKey) == ModeFriends)
+                EventManager.FireShowView(ViewType.MatchmakingFriends);
         });
     }
 

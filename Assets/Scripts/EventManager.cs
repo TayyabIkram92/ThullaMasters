@@ -21,6 +21,9 @@ public static partial class EventManager
     public static event Action<string> OnShowPopUp;
 
     public static void FireShowPopUp(string message) => OnShowPopUp?.Invoke(message);
+    public static event Action OnInviteSent;
+    public static void FireInviteSent() => OnInviteSent?.Invoke();
+// (OnInviteAccepted, OnInviteRejected, OnInviteResponseRequested already exist from previous session)
 
 // Events
     public static event Action<string, string, bool> OnInviteResponseRequested;

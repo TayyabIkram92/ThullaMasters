@@ -8,8 +8,9 @@ using UnityEngine.UI;
 /// </summary>
 public class OnlineFriendsView : MonoBehaviour
 {
-    [Header("References")]
-    [SerializeField] private Transform cardContainer;
+    [Header("References")] [SerializeField]
+    private Transform cardContainer;
+
     [SerializeField] private OnlineFriendCard cardPrefab;
     [SerializeField] private Button closeButton;
 
@@ -48,7 +49,11 @@ public class OnlineFriendsView : MonoBehaviour
     private OnlineFriendCard GetFromPool()
     {
         foreach (var card in _pool)
-            if (!card.gameObject.activeSelf) { card.gameObject.SetActive(true); return card; }
+            if (!card.gameObject.activeSelf)
+            {
+                card.gameObject.SetActive(true);
+                return card;
+            }
 
         var newCard = Instantiate(cardPrefab, cardContainer);
         _pool.Add(newCard);
@@ -82,7 +87,12 @@ public class OnlineFriendsView : MonoBehaviour
             Debug.LogWarning("[OnlineFriendsView] No room ID to invite into.");
             return;
         }
+
         EventManager.FireSendInviteRequested(friend.PlayFabId, roomId);
+
+        // Notify MatchmakingView to hide AddIcon/PopupAddFriend and disable back button
+        EventManager.FireInviteSent();
+
         // Close after invite sent
         EventManager.FireHideView(ViewType.OnlineFriends);
     }
