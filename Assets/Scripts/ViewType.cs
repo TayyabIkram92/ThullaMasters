@@ -20,5 +20,6 @@ public enum ViewType
     Win,
     Lose,
     InvitePopUp,
-    MatchmakingFriends
+    MatchmakingFriends,
+    UpdateGame
 }
