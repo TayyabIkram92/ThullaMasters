@@ -89,8 +89,13 @@ public class BotStrategy
     /// <summary>Returns true if this card has already been played in any round.</summary>
     public bool IsKnownCard(string card) => _knownCards.Contains(card);
 
-    /// <summary>Main entry point called by GameManager.AutoPlay.</summary>
-    public string ChooseCard(GameState gs, string botId, List<string> hand)
+    /// <summary>
+    /// Main entry point called by GameManager.AutoPlay.
+    /// isBot delegate is passed from GameManager.IsBot so ghost-bot IDs
+    /// (players set as bots via turnPlayerToBot) are treated identically
+    /// to real BOT_ prefixed bots throughout all strategy logic.
+    /// </summary>
+    public string ChooseCard(GameState gs, string botId, List<string> hand, System.Func<string, bool> isBot)
     {
         if (hand == null || hand.Count == 0) return null;
 
@@ -121,7 +126,8 @@ public class BotStrategy
             if (myIndex >= 0)
             {
                 string nextId = gs.activePlayers[(myIndex + 1) % gs.activePlayers.Count];
-                bool nextIsBot = nextId != null && nextId.StartsWith("BOT_");
+                // Use isBot delegate — correctly handles both BOT_ prefix and ghost bots
+                bool nextIsBot = nextId != null && isBot(nextId);
                 if (nextIsBot)
                 {
                     Debug.Log($"[BotStrategy] 3-player steal: {botId} steals from {nextId}");
@@ -135,8 +141,8 @@ public class BotStrategy
 
         bool isLeading = string.IsNullOrEmpty(gs.leadSuit);
         return isLeading
-            ? LeadingLogic(gs, botId, hand)
-            : FollowingLogic(gs, botId, hand);
+            ? LeadingLogic(gs, botId, hand, isBot)
+            : FollowingLogic(gs, botId, hand, isBot);
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -160,7 +166,7 @@ public class BotStrategy
     //  LEADING LOGIC
     // ═══════════════════════════════════════════════════════════════════════
 
-    private string LeadingLogic(GameState gs, string botId, List<string> hand)
+    private string LeadingLogic(GameState gs, string botId, List<string> hand, System.Func<string, bool> isBot)
     {
         var active = gs.activePlayers;
         int myIndex = active.IndexOf(botId);
@@ -225,14 +231,14 @@ public class BotStrategy
 
         // ── Final fallback ───────────────────────────────────────────────────
         string leadDiscard = DiscardUsingLowestSuitAlgorithm(hand, "");
-        return UpgradeDiscardWithOtherBots(gs, botId, leadDiscard);
+        return UpgradeDiscardWithOtherBots(gs, botId, leadDiscard, isBot);
     }
 
     // ═══════════════════════════════════════════════════════════════════════
     //  FOLLOWING LOGIC
     // ═══════════════════════════════════════════════════════════════════════
 
-    private string FollowingLogic(GameState gs, string botId, List<string> hand)
+    private string FollowingLogic(GameState gs, string botId, List<string> hand, System.Func<string, bool> isBot)
     {
         // ══════════════════════════════════════════════════════════════════
         //  FOLLOWING LOGIC — COMPLETE PRIORITY ORDER
@@ -378,7 +384,7 @@ public class BotStrategy
 
         // No lead suit → discard, then upgrade the chosen card with other bots
         string discardCard = DiscardUsingLowestSuitAlgorithm(hand, leadSuit);
-        return UpgradeDiscardWithOtherBots(gs, botId, discardCard);
+        return UpgradeDiscardWithOtherBots(gs, botId, discardCard, isBot);
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -665,9 +671,12 @@ public class BotStrategy
     //  Example 2 (no upgrade available):
     //    Bot1 chosen card = JH. No other bot has any Heart higher than J.
     //    → Play JH as-is.
+    //
+    //  isBot delegate is used so ghost-bot players (set via turnPlayerToBot)
+    //  participate in swaps identically to real BOT_ prefixed bots.
     // ═══════════════════════════════════════════════════════════════════════
 
-    private string UpgradeDiscardWithOtherBots(GameState gs, string botId, string chosenCard)
+    private string UpgradeDiscardWithOtherBots(GameState gs, string botId, string chosenCard, System.Func<string, bool> isBot)
     {
         if (string.IsNullOrEmpty(chosenCard)) return chosenCard;
 
@@ -678,7 +687,8 @@ public class BotStrategy
         if (gs.cardsInPlay != null && gs.cardsInPlay.Count > 0)
         {
             string leadPlayer = gs.cardsInPlay[0].playerId;
-            if (leadPlayer != null && leadPlayer.StartsWith("BOT_"))
+            // Use isBot delegate — correctly handles both BOT_ prefix and ghost bots
+            if (leadPlayer != null && isBot(leadPlayer))
             {
                 Debug.Log($"[Discard Upgrade] Skipped — trick was led by bot {leadPlayer}");
                 return chosenCard;
@@ -706,7 +716,8 @@ public class BotStrategy
         foreach (string pid in gs.activePlayers)
         {
             if (pid == botId) continue; // skip self
-            if (!pid.StartsWith("BOT_")) continue; // only swap with other bots
+            // Use isBot delegate — correctly handles both BOT_ prefix and ghost bots
+            if (!isBot(pid)) continue; // only swap with other bots
             if (!gs.hands.ContainsKey(pid)) continue;
 
             foreach (string c in gs.hands[pid])

@@ -311,39 +311,38 @@ public class HostWatchdog : MonoBehaviour
 
     // ── Self Disconnect ───────────────────────────────────────────────────────
 
+    // AFTER:
     private void HandleSelfDisconnect()
     {
         if (!_active) return;
         _active = false;
         StopAllCoroutines();
 
-        // If we're host, write result so non-hosts see it before we reload
-        if (_isHost && _room != null)
+        if (_room != null)
         {
+            string myId = PlayerDataManager.PlayFabId;
             var winners = new List<object>();
             if (_room.players != null)
                 foreach (var p in _room.players)
-                    if (p.id != _room.hostId)
+                    if (p.id != myId)
                         winners.Add((object)p.id);
 
             FirebaseManager.DB.Collection(RoomsCollection).Document(_room.roomId)
                 .UpdateAsync(new Dictionary<string, object>
                 {
                     { "gameState.phase", GameState.PhaseFinished },
-                    { "gameState.bhabhi", _room.hostId },
+                    { "gameState.bhabhi", myId },
                     { "gameState.winners", winners }
                 });
         }
 
         _room = null;
-
-        // We lose — just reload. WinView will show on the other players' devices.
-        Debug.Log("[HostWatchdog] Self-disconnect — reloading scene.");
         SceneManager.LoadScene(SceneManager.GetActiveScene().buildIndex);
     }
 
     // ── Voluntary Leave ───────────────────────────────────────────────────────
 
+    // AFTER:
     private void HandleLeaveRequested()
     {
         if (!_active)
@@ -355,28 +354,27 @@ public class HostWatchdog : MonoBehaviour
         _active = false;
         StopAllCoroutines();
 
-        // Zero heartbeat so peers detect us immediately
         ZeroMyHeartbeat();
 
-        if (_isHost && _room != null)
+        if (_room != null)
         {
+            string myId = PlayerDataManager.PlayFabId;
             var winners = new List<object>();
             if (_room.players != null)
                 foreach (var p in _room.players)
-                    if (p.id != _room.hostId)
+                    if (p.id != myId)
                         winners.Add((object)p.id);
 
             FirebaseManager.DB.Collection(RoomsCollection).Document(_room.roomId)
                 .UpdateAsync(new Dictionary<string, object>
                 {
                     { "gameState.phase", GameState.PhaseFinished },
-                    { "gameState.bhabhi", _room.hostId },
+                    { "gameState.bhabhi", myId },
                     { "gameState.winners", winners }
                 });
         }
 
         _room = null;
-        // Navigation handled by InGameView.OnLeaveClicked → InGameManager
     }
 
     // ── Normal Game Finished ──────────────────────────────────────────────────

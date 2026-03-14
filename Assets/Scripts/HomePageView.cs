@@ -1,6 +1,7 @@
 using UnityEngine;
 using UnityEngine.UI;
 using TMPro;
+using Firebase.Firestore;
 
 public class HomePageView : MonoBehaviour
 {
@@ -45,6 +46,7 @@ public class HomePageView : MonoBehaviour
         EventManager.OnCoinsUpdated += HandleCoinsUpdated;
         EventManager.OnGameModesFetched += HandleGameModesFetched;
 
+        CheckAppVersion();
         RefreshUI();
         CheckAndAwardTrophyReward();
         CheckFirstTimeProfile();
@@ -57,8 +59,8 @@ public class HomePageView : MonoBehaviour
         friendsButton.onClick.RemoveListener(OnFriendsClicked);
         settingsButton.onClick.RemoveListener(OnSettingsClicked);
         tutorialButton.onClick.RemoveListener(OnTutorialClicked);
-        profileButton.onClick.AddListener(ProfileButtonClicked);
-        addButton.onClick.AddListener(AddButtonClicked);
+        profileButton.onClick.RemoveListener(ProfileButtonClicked); // BUG FIX: was AddListener
+        addButton.onClick.RemoveListener(AddButtonClicked); // BUG FIX: was AddListener
         if (buyCoinsButton) buyCoinsButton.onClick.RemoveListener(OnBuyCoinsClicked);
         if (sellCoinsButton) sellCoinsButton.onClick.RemoveListener(OnSellCoinsClicked);
 
@@ -67,6 +69,57 @@ public class HomePageView : MonoBehaviour
 
         _pendingGameSelection = false;
     }
+
+    // ─────────────────────────────────────────────────────────────
+    //  Version Check
+    // ─────────────────────────────────────────────────────────────
+
+    private async void CheckAppVersion()
+    {
+        try
+        {
+            FirebaseFirestore db = FirebaseFirestore.DefaultInstance;
+            DocumentReference docRef = db.Collection("appConfig").Document("version");
+            DocumentSnapshot snapshot = await docRef.GetSnapshotAsync();
+
+            if (!snapshot.Exists) return;
+
+            string minRequired = snapshot.GetValue<string>("minRequiredVersion");
+            string message = snapshot.GetValue<string>("message");
+            string androidUrl = snapshot.GetValue<string>("androidUrl");
+            string currentVersion = Application.version; // reads Project Settings > Other Settings > Version
+
+            if (IsUpdateRequired(currentVersion, minRequired))
+            {
+                UpdateGameView.PendingMessage = message;
+                UpdateGameView.PendingAndroidUrl = androidUrl;
+                EventManager.FireShowView(ViewType.UpdateGame, true);
+            }
+        }
+        catch (System.Exception e)
+        {
+            Debug.LogWarning($"[HomePageView] Version check failed: {e.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Returns true when <paramref name="current"/> is older than <paramref name="required"/>.
+    /// Compares version strings in "MAJOR.MINOR.PATCH" format.
+    /// </summary>
+    private bool IsUpdateRequired(string current, string required)
+    {
+        System.Version cur, req;
+        if (System.Version.TryParse(current, out cur) &&
+            System.Version.TryParse(required, out req))
+            return cur < req;
+
+        // Fallback: plain string comparison
+        return current != required;
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    //  Button Handlers
+    // ─────────────────────────────────────────────────────────────
 
     private void AddButtonClicked()
     {
@@ -77,6 +130,10 @@ public class HomePageView : MonoBehaviour
     {
         EventManager.FireShowView(ViewType.Profile, true);
     }
+
+    // ─────────────────────────────────────────────────────────────
+    //  UI
+    // ─────────────────────────────────────────────────────────────
 
     public void RefreshUI()
     {

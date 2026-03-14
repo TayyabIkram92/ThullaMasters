@@ -363,7 +363,7 @@ public class GameManager : MonoBehaviour
         if (_gs == null || !_gs.hands.ContainsKey(playerId)) return;
 
         string card = useHardBot && IsBot(playerId)
-            ? ChooseHardBotCard(playerId, _gs.hands[playerId])
+            ? ChooseHardBotCard(playerId, _gs.hands[playerId], IsBot)
             : ChooseAutoCard(playerId, _gs.hands[playerId]);
 
         if (card == "STEAL")
@@ -401,8 +401,8 @@ public class GameManager : MonoBehaviour
 
     private readonly BotStrategy _botStrategy = new BotStrategy();
 
-    private string ChooseHardBotCard(string botId, List<string> hand)
-        => _botStrategy.ChooseCard(_gs, botId, hand);
+    private string ChooseHardBotCard(string botId, List<string> hand, System.Func<string, bool> isBot)
+        => _botStrategy.ChooseCard(_gs, botId, hand, isBot);
 
     private void RecordPlayHistory(string playerId, string cardCode)
         => _botStrategy.RecordMove(_gs, playerId, cardCode);
@@ -1624,6 +1624,7 @@ public class GameManager : MonoBehaviour
     /// Treats the disconnected player as Bhabhi (they lose) and continues the game
     /// for everyone else. If removing them leaves only 1 active player, ends the game.
     /// </summary>
+    // AFTER:
     public void ForceRemovePlayer(string playerId)
     {
         if (!_isHost || _gs == null || !_gameActive) return;
@@ -1631,7 +1632,6 @@ public class GameManager : MonoBehaviour
 
         Debug.LogWarning($"[GameManager] ForceRemovePlayer: {playerId} dropped out.");
 
-        // If it was this player's turn, clear any in-flight state
         bool wasCurrentPlayer = _gs.CurrentPlayerId == playerId;
         if (wasCurrentPlayer)
         {
@@ -1640,45 +1640,23 @@ public class GameManager : MonoBehaviour
             _isExecutingMove = false;
         }
 
-        // Clear their cards-in-play contribution so the round doesn't get stuck
         _gs.cardsInPlay.RemoveAll(pc => pc.playerId == playerId);
-
-        // Remove from active players and mark as Bhabhi
         _gs.activePlayers.Remove(playerId);
         _gs.bhabhi = playerId;
-        AdjustCurrentIndexAfterRemoval();
 
-        if (CheckGameOver()) return;
+        // Add all remaining active players as winners
+        foreach (var id in _gs.activePlayers)
+            if (!_gs.winners.Contains(id))
+                _gs.winners.Add(id);
 
-        // If they were mid-round and other players have already played cards,
-        // the round may now be complete — check and resolve
-        bool roundComplete = _gs.cardsInPlay.Count > 0 &&
-                             _gs.cardsInPlay.Count >= _gs.activePlayers.Count;
-        bool outOfSuit = _gs.cardsInPlay.Count > 1 &&
-                         !string.IsNullOrEmpty(_gs.leadSuit) &&
-                         GetSuit(_gs.cardsInPlay[_gs.cardsInPlay.Count - 1].card) != _gs.leadSuit;
+        _gs.activePlayers.Clear();
+        _gs.phase = GameState.PhaseFinished;
 
-        if (outOfSuit && _gs.roundNumber > 1)
+        WriteGameState(() =>
         {
-            StopResolveCoroutine();
-            _lastProcessedTurnKey = -1;
-            _gs.turnStartTime = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-            ShowCardsAndDelay(() => ResolveOutOfSuit());
-        }
-        else if (roundComplete)
-        {
-            StopResolveCoroutine();
-            _lastProcessedTurnKey = -1;
-            _gs.turnStartTime = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-            ShowCardsAndDelay(() => ResolveRound());
-        }
-        else
-        {
-            // Reset turn key so the next ProcessCurrentTurn isn't treated as a dup
-            _lastProcessedTurnKey = -1;
-            _gs.turnStartTime = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-            WriteGameStateAndProcess();
-        }
+            EventManager.FireGameStateUpdated(_gs);
+            HandleGameFinished();
+        });
     }
 
     private void HandleLeaveGame()
