@@ -995,13 +995,66 @@ public class MatchmakingManager : MonoBehaviour
         _botNameIndex = 0;
     }
 
-    private string[] DefaultBotNames() => new[]
+    private string[] DefaultBotNames()
     {
-        "Iqra", "Nusha", "Iffat", "Mujtaba", "Danish", "Usman", "Shaista", "Roohi",
-        "Ghazal", "Taimoor", "Nimra", "Saira", "Kanza", "Waleed", "Maha", "Shazia",
-        "Hadi", "Muneeb", "Kabir", "Rubab", "Hamza", "Fareeha", "Naveed", "Laila",
-        "Rashid", "Amna", "Asif", "Haris", "Khalid", "Fahd"
-    };
+        var maleFirstNames = new[]
+        {
+            "Ali", "Ahmed", "Usman", "Hamza", "Hassan", "Hussain", "Bilal", "Danish", "Saad", "Fahad",
+            "Omar", "Talha", "Adeel", "Imran", "Kamran", "Noman", "Waqas", "Rizwan", "Asad", "Shahzaib",
+            "Junaid", "Tariq", "Farhan", "Arslan", "Zain", "Adnan", "Sami", "Yasir", "Naveed", "Mudassir",
+            "Salman", "Taimoor", "Haroon", "Sajid", "Majid", "Ahsan", "Zubair", "Shahid", "Azhar", "Akram",
+            "Waqar", "Sohail", "Nadeem", "Javed", "Sarfraz", "Iqbal", "Naseer", "Shahbaz", "Arif", "Kashif",
+            "Zeeshan", "Shoaib", "Aamir", "Rauf", "Imtiaz", "Faisal", "Waleed", "Umair", "Dawood", "Anas",
+            "Rehan", "Saifullah", "Muneeb", "Hadi", "Usama", "Hamid", "Raheel", "Taha", "Sameer", "Irfan",
+            "Qasim", "Sultan", "Sarmad", "Basit", "Furqan", "Asim", "Nabil", "Aqeel", "Jawad", "Talal",
+            "Rafiq", "Munir", "Zafar", "Mustafa", "Rasheed", "Haroon", "Shakir", "Latif", "Nadir", "Shayan"
+        };
+
+        var femaleFirstNames = new[]
+        {
+            "Ayesha", "Fatima", "Zainab", "Maryam", "Hira", "Iqra", "Amna", "Laiba", "Noor", "Mahnoor",
+            "Eman", "Hafsa", "Maham", "Areeba", "Mehwish", "Sana", "Sidra", "Saba", "Khadija", "Rabia",
+            "Nimra", "Madiha", "Sadia", "Shazia", "Anum", "Kanza", "Aiman", "Rida", "Aleena", "Komal",
+            "Sehrish", "Sahar", "Minal", "Anaya", "Hoor", "Zoya", "Inaya", "Rimsha", "Sania", "Bushra"
+        };
+
+        var surnames = new[]
+        {
+            "Khan", "Ahmed", "Malik", "Butt", "Sheikh", "Shah", "Raza", "Chaudhry", "Farooq", "Abbasi"
+        };
+
+        var names = new List<string>();
+
+        // Generate 900 male names
+        foreach (var first in maleFirstNames)
+        {
+            foreach (var last in surnames)
+            {
+                names.Add(first + last);
+                if (names.Count == 900)
+                    break;
+            }
+
+            if (names.Count == 900)
+                break;
+        }
+
+        // Generate 100 female names
+        foreach (var first in femaleFirstNames)
+        {
+            foreach (var last in surnames)
+            {
+                names.Add(first + last);
+                if (names.Count == 1000)
+                    break;
+            }
+
+            if (names.Count == 1000)
+                break;
+        }
+
+        return names.ToArray();
+    }
 
     [Serializable]
     private class BotNamesWrapper

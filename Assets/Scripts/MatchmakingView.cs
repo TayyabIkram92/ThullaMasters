@@ -84,8 +84,12 @@ public class MatchmakingView : MonoBehaviour
         PlayerPrefs.DeleteKey("IsInvitedUser");
         PlayerPrefs.Save();
 
-        if (entryFeeTxt != null && GameModeManager.SelectedMode != null)
-            entryFeeTxt.text = GameModeManager.SelectedMode.EntryFee.ToString();
+        // Show the plain entry fee number (e.g. 200, 1000, 2000).
+        // For both host and invited users, entryFeeTxt is updated authoritatively
+        // in HandleRoomUpdated once real RoomData arrives from Firestore.
+        // We clear the text here so there's no stale value visible during the join.
+        if (entryFeeTxt != null)
+            entryFeeTxt.text = "";
 
         if (_isInvitedUser)
         {
@@ -147,6 +151,12 @@ public class MatchmakingView : MonoBehaviour
     private void HandleRoomUpdated(RoomData room)
     {
         _currentRoom = room;
+
+        // Authoritative entry fee comes from the room itself — update for both
+        // host and invited users as soon as real RoomData arrives.
+        if (entryFeeTxt != null && room.entryFee > 0)
+            entryFeeTxt.text = room.entryFee.ToString();
+
         UpdateSlots(room);
 
         bool allFilled = room.players != null && room.players.Count >= 4;
@@ -156,8 +166,12 @@ public class MatchmakingView : MonoBehaviour
             _hasDeductedCoins = true;
             DisableStartAndBack();
 
-            if (GameModeManager.SelectedMode != null)
-                EventManager.FireDeductCoinsRequested(GameModeManager.SelectedMode.EntryFee);
+            // Always deduct the entry fee from the room itself, not from SelectedMode.
+            // This ensures invited players pay the correct room fee, not whatever
+            // mode was last selected on their device.
+            int feeToDeduct = room.entryFee;
+            if (feeToDeduct > 0)
+                EventManager.FireDeductCoinsRequested(feeToDeduct);
         }
     }
 
@@ -329,10 +343,15 @@ public class MatchmakingView : MonoBehaviour
     private void HandleMatchmakingError(string message)
     {
         searchingTxt.text = "Error: " + message;
-        if (_hasDeductedCoins && GameModeManager.SelectedMode != null)
+        if (_hasDeductedCoins)
         {
-            EventManager.FireAddCoinsRequested(
-                GameModeManager.SelectedMode.EntryFee, "matchmaking_refund");
+            int feeToRefund = (_currentRoom != null && _currentRoom.entryFee > 0)
+                ? _currentRoom.entryFee
+                : (GameModeManager.SelectedMode != null ? GameModeManager.SelectedMode.EntryFee : 0);
+
+            if (feeToRefund > 0)
+                EventManager.FireAddCoinsRequested(feeToRefund, "matchmaking_refund");
+
             _hasDeductedCoins = false;
         }
 
@@ -362,10 +381,15 @@ public class MatchmakingView : MonoBehaviour
     {
         EventManager.FireMatchmakingCancelRequested();
 
-        if (_hasDeductedCoins && GameModeManager.SelectedMode != null)
+        if (_hasDeductedCoins)
         {
-            EventManager.FireAddCoinsRequested(
-                GameModeManager.SelectedMode.EntryFee, "matchmaking_cancelled");
+            int feeToRefund = (_currentRoom != null && _currentRoom.entryFee > 0)
+                ? _currentRoom.entryFee
+                : (GameModeManager.SelectedMode != null ? GameModeManager.SelectedMode.EntryFee : 0);
+
+            if (feeToRefund > 0)
+                EventManager.FireAddCoinsRequested(feeToRefund, "matchmaking_cancelled");
+
             _hasDeductedCoins = false;
         }
 

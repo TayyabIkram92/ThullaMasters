@@ -103,9 +103,18 @@ public class InvitePopupView : MonoBehaviour
             // BEFORE MatchmakingView.ResetView() reads it.
             EventManager.FireAcceptInviteRequested(_roomId);
 
+            // Hide popup and clean up all invite PlayerPrefs.
+            // Entry fee is now read directly from RoomData in MatchmakingView.HandleRoomUpdated,
+            // so InviteEntryFee no longer needs to survive past this point.
+            PlayerPrefs.DeleteKey("InviteSenderName");
+            PlayerPrefs.DeleteKey("InviteSenderId");
+            PlayerPrefs.DeleteKey("InviteRoomId");
+            PlayerPrefs.DeleteKey("InviteEntryFee");
+            PlayerPrefs.Save();
+
             EventManager.FireHideView(ViewType.InvitePopUp);
 
-            // Navigate to matchmaking — ResetView reads IsInvitedUser=1 set above
+            // Navigate to matchmaking — ResetView reads IsInvitedUser=1
             EventManager.FireShowView(ViewType.Matchmaking);
         });
     }

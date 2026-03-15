@@ -29,6 +29,12 @@ public class InviteManager : MonoBehaviour
     private ListenerRegistration _inviteListener;
     private ListenerRegistration _responseListener; // host listens for accept/reject responses
 
+    // Tracks pending offline-timeout coroutines keyed by recipientId.
+    // If the recipient responds (accept OR reject) before the timeout fires,
+    // the coroutine is cancelled so HandleInviteRejected is not called twice.
+    private readonly Dictionary<string, Coroutine> _pendingOfflineTimeouts =
+        new Dictionary<string, Coroutine>();
+
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
     private void OnEnable()
@@ -118,7 +124,40 @@ public class InviteManager : MonoBehaviour
                     PlayerPrefs.SetInt("InviteEntryFee", entryFee);
                     PlayerPrefs.Save();
 
-                    EventManager.FireInviteReceived(senderName, senderId, roomId);
+                    // ── Coin check: silently auto-reject if player cannot afford the entry fee ──
+                    // We must dispatch back to the main thread because Firestore listeners
+                    // fire on a background thread and EventManager.FireGetCoinsRequested
+                    // is a synchronous Unity-side callback.
+                    int capturedEntryFee = entryFee;
+                    string capturedRoomId = roomId;
+                    string capturedSenderId = senderId;
+                    string capturedSenderName = senderName;
+                    DocumentReference capturedDocRef = doc.Reference;
+
+                    UnityMainThreadDispatcher.Enqueue(() =>
+                    {
+                        EventManager.FireGetCoinsRequested(coins =>
+                        {
+                            if (coins < capturedEntryFee)
+                            {
+                                Debug.Log(
+                                    $"[InviteManager] Auto-rejecting invite — need {capturedEntryFee} coins, have {coins}.");
+
+                                // Notify host of rejection so they are not left waiting
+                                EventManager.FireInviteResponseRequested(capturedRoomId, capturedSenderId, false);
+
+                                // Clean up the invite doc immediately
+                                capturedDocRef.DeleteAsync();
+                                PlayerPrefs.DeleteKey("InviteDocId");
+                                PlayerPrefs.DeleteKey("InviteEntryFee");
+                                PlayerPrefs.Save();
+                                return;
+                            }
+
+                            // Player has enough coins — show the popup
+                            EventManager.FireInviteReceived(capturedSenderName, capturedSenderId, capturedRoomId);
+                        });
+                    });
                 }
             });
     }
@@ -153,9 +192,15 @@ public class InviteManager : MonoBehaviour
                     doc.Reference.DeleteAsync();
 
                     if (accepted)
+                    {
+                        CancelOfflineTimeout(recipientId);
                         EventManager.FireInviteAccepted(recipientId);
+                    }
                     else
+                    {
+                        CancelOfflineTimeout(recipientId);
                         EventManager.FireInviteRejected(recipientId);
+                    }
                 }
             });
     }
@@ -228,12 +273,46 @@ public class InviteManager : MonoBehaviour
 
         // Start listening for the response so host knows accept/reject
         StartListeningForInviteResponses(roomId);
+
+        // If recipient is offline their Firestore listener never fires,
+        // so we auto-reject on the host side after the same 10-second window.
+        string capturedRecipient = recipientPlayFabId;
+        CancelOfflineTimeout(capturedRecipient); // clear any stale timeout for this recipient
+        Coroutine timeout = StartCoroutine(AutoRejectIfNoResponse(capturedRecipient, 10f));
+        _pendingOfflineTimeouts[capturedRecipient] = timeout;
     }
 
     private IEnumerator DeleteInviteAfterDelay(DocumentReference docRef, float delay)
     {
         yield return new WaitForSeconds(delay);
         docRef?.DeleteAsync();
+    }
+
+    /// <summary>
+    /// Fires FireInviteRejected on the host side if the recipient never responds
+    /// within <paramref name="delay"/> seconds. Covers the offline / app-closed case
+    /// where the recipient's Firestore listener never fires and no response doc is written.
+    /// </summary>
+    private IEnumerator AutoRejectIfNoResponse(string recipientId, float delay)
+    {
+        yield return new WaitForSeconds(delay);
+
+        // If we're still tracking this recipient they never responded — treat as rejection.
+        if (_pendingOfflineTimeouts.ContainsKey(recipientId))
+        {
+            _pendingOfflineTimeouts.Remove(recipientId);
+            Debug.Log($"[InviteManager] No response from {recipientId} after {delay}s — auto-rejecting (offline).");
+            EventManager.FireInviteRejected(recipientId);
+        }
+    }
+
+    private void CancelOfflineTimeout(string recipientId)
+    {
+        if (_pendingOfflineTimeouts.TryGetValue(recipientId, out Coroutine c))
+        {
+            if (c != null) StopCoroutine(c);
+            _pendingOfflineTimeouts.Remove(recipientId);
+        }
     }
 
     // ── Invite Response (recipient writes, host reads) ────────────────────────
@@ -316,11 +395,21 @@ public class InviteManager : MonoBehaviour
     {
         StopInviteListener();
         StopResponseListener();
+        CancelAllOfflineTimeouts();
     }
 
     private void HandleRoomLeft()
     {
         StopResponseListener();
+        CancelAllOfflineTimeouts();
         StartCoroutine(WaitAndStartListening());
+    }
+
+    private void CancelAllOfflineTimeouts()
+    {
+        foreach (var kvp in _pendingOfflineTimeouts)
+            if (kvp.Value != null)
+                StopCoroutine(kvp.Value);
+        _pendingOfflineTimeouts.Clear();
     }
 }

@@ -23,6 +23,7 @@ public class GameManager : MonoBehaviour
     private Coroutine _turnTimerCoroutine;
     private Coroutine _botCoroutine;
     private Coroutine _resolveCoroutine;
+    private Coroutine _botWatchdogCoroutine;
     private ListenerRegistration _listener;
     private const float ResolveDelaySeconds = 3f;
     private List<string> _myHand = new List<string>();
@@ -224,7 +225,11 @@ public class GameManager : MonoBehaviour
 
                 _gameActive = _gs.phase != GameState.PhaseFinished;
 
-                if (turnChanged) _isExecutingMove = false;
+                if (turnChanged)
+                {
+                    _isExecutingMove = false;
+                    StopBotWatchdog();
+                }
 
                 // Fire sounds BEFORE FireGameStateUpdated so the UI and audio
                 // update together in the same frame.
@@ -288,8 +293,13 @@ public class GameManager : MonoBehaviour
         _lastProcessedTurnKey = turnKey;
         _isExecutingMove = false;
 
-        // INFINITE LOOP FIX: Check game over after auto-removing a player
-        if (_gs.hands.ContainsKey(currentId) && _gs.hands[currentId].Count == 0)
+        // INFINITE LOOP FIX: If the current player has no cards, remove them.
+        // STRICT RULE: Only the host performs this mutation and writes to Firestore.
+        // Non-host clients must wait for the Firestore listener to deliver the
+        // updated state from the host. If non-hosts also remove players here,
+        // multiple clients will each call CheckGameOver on their own stale local
+        // state, which can produce a false game-over / false WinView.
+        if (_isHost && _gs.hands.ContainsKey(currentId) && _gs.hands[currentId].Count == 0)
         {
             if (!_gs.winners.Contains(currentId)) _gs.winners.Add(currentId);
             _gs.activePlayers.Remove(currentId);
@@ -301,6 +311,17 @@ public class GameManager : MonoBehaviour
             return;
         }
 
+        // Non-host: if the current player has no cards, do nothing here.
+        // The host will detect this, write the updated state, and the Firestore
+        // listener on this client will trigger ProcessCurrentTurn again with the
+        // corrected state.
+        if (!_isHost && _gs.hands.ContainsKey(currentId) && _gs.hands[currentId].Count == 0)
+        {
+            Debug.Log(
+                $"[GameManager] Non-host: current player {currentId} has empty hand — waiting for host to resolve.");
+            return;
+        }
+
         float remaining = _gs.SecondsRemaining(GameState.TurnSeconds);
         if (remaining < 2f) remaining = 2f;
 
@@ -309,17 +330,20 @@ public class GameManager : MonoBehaviour
 
         _turnTimerCoroutine = StartCoroutine(TurnTimerCoroutine(remaining));
 
-        if (IsBot(currentId) && (_isHost || currentId == PlayerDataManager.PlayFabId))
+        // Only the HOST starts bot move coroutines and watchdogs.
+        // Non-hosts never write bot moves — all bot execution is centralised on the host.
+        // This is the strict rule that prevents two clients from writing the same bot turn.
+        if (_isHost && IsBot(currentId))
         {
-            float botDelay;
-            if (turnPlayerToBot && ghostBotIds != null && System.Array.IndexOf(ghostBotIds, currentId) >= 0)
-                botDelay = 3f;
-            else
-                botDelay = UnityEngine.Random.Range(1f, 3f);
-
+            float botDelay = UnityEngine.Random.Range(1f, 3f);
             float effectiveDelay = Mathf.Min(botDelay, remaining - 1f);
             if (effectiveDelay < 0.5f) effectiveDelay = 0.5f;
             _botCoroutine = StartCoroutine(BotMoveCoroutine(currentId, effectiveDelay));
+
+            // Watchdog: if the bot move never completes (write failed, listener
+            // dropped, etc.) this will force the move after a safe timeout.
+            StopBotWatchdog();
+            _botWatchdogCoroutine = StartCoroutine(BotWatchdogCoroutine(currentId, _lastProcessedTurnKey));
         }
     }
 
@@ -329,18 +353,20 @@ public class GameManager : MonoBehaviour
         if (!_gameActive || _gs == null) yield break;
         string currentId = _gs.CurrentPlayerId;
         string localId = PlayerDataManager.PlayFabId;
+
         if (currentId == localId && !_isExecutingMove)
         {
-            Debug.Log("[GameManager] Timer expired — auto-playing.");
+            // It is the local human player's turn and they haven't acted — auto-play.
+            Debug.Log("[GameManager] Timer expired — auto-playing for local player.");
             _isExecutingMove = true;
             AutoPlay(localId);
         }
         else if (_isHost && IsBot(currentId))
         {
-            Debug.Log($"[GameManager] Bot timer expired for {currentId}.");
+            // Only the host forces bot moves on timer expiry.
+            // Non-hosts never write bot moves — that is strictly the host's responsibility.
+            Debug.Log($"[GameManager] Bot timer expired for {currentId} — host forcing move.");
             StopBotCoroutine();
-            // Bug 5 fix: guard against double-play if BotMoveCoroutine already called
-            // AutoPlay but its async write hasn't completed yet.
             if (!_isExecutingMove)
             {
                 _isExecutingMove = true;
@@ -795,21 +821,36 @@ public class GameManager : MonoBehaviour
         var receivedCards = new List<string>();
         bool special2pEnd = false;
 
-        if (_gs.activePlayers.Count == 2 && _gs.hands.ContainsKey(pickupId) && _gs.hands[pickupId].Count == 0)
-        {
-            string tochooId = _gs.cardsInPlay[_gs.cardsInPlay.Count - 1].playerId;
-            _gs.winners.Add(tochooId);
-            _gs.activePlayers.Remove(tochooId);
-            _gs.bhabhi = pickupId;
-            special2pEnd = true;
-        }
-        else if (!string.IsNullOrEmpty(pickupId) && _gs.hands.ContainsKey(pickupId))
+        // Always give the cards to pickupId first — even if their hand was empty
+        // before receiving (e.g. they just played their last card as the lead).
+        // We decide whether this is a special 2-player end AFTER the hand is updated.
+        if (!string.IsNullOrEmpty(pickupId) && _gs.hands.ContainsKey(pickupId))
         {
             foreach (var pc in _gs.cardsInPlay)
             {
                 _gs.hands[pickupId].Add(pc.card);
                 receivedCards.Add(pc.card);
             }
+        }
+
+        // Special 2-player end: only applies when pickupId's hand is STILL empty
+        // after receiving the cards — which is impossible (they just received cards),
+        // so this branch now correctly never fires for the "last card + thulla" case.
+        // It remains as a safety guard for any future edge-case where pickupId truly
+        // ends up with no cards post-pickup.
+        if (_gs.activePlayers.Count == 2 && _gs.hands.ContainsKey(pickupId) && _gs.hands[pickupId].Count == 0)
+        {
+            string tochooId = _gs.cardsInPlay.Count > 0
+                ? _gs.cardsInPlay[_gs.cardsInPlay.Count - 1].playerId
+                : "";
+            if (!string.IsNullOrEmpty(tochooId))
+            {
+                _gs.winners.Add(tochooId);
+                _gs.activePlayers.Remove(tochooId);
+            }
+
+            _gs.bhabhi = pickupId;
+            special2pEnd = true;
         }
 
         _gs.cardsInPlay.Clear();
@@ -1422,26 +1463,97 @@ public class GameManager : MonoBehaviour
 
     private IEnumerator BotMoveCoroutine(string botId, float delay)
     {
-        // Bug 2 fix: snapshot the turn key at coroutine start so mid-flight _gs
-        // replacement by the Firestore listener cannot cause a false-pass or false-fail.
-        int expectedTurnKey = _lastProcessedTurnKey;
+        // Calculate the card IMMEDIATELY before any delay so nothing can
+        // invalidate the decision while we wait. The coroutine only owns
+        // the visual pause — the move itself is already decided and locked in.
+        if (_gs == null || !_gs.hands.ContainsKey(botId)) yield break;
 
+        string card = useHardBot
+            ? ChooseHardBotCard(botId, _gs.hands[botId], IsBot)
+            : ChooseAutoCard(botId, _gs.hands[botId]);
+
+        // Lock the move immediately so no other path (timer fallback, listener
+        // re-delivery) can fire a second AutoPlay for this turn.
+        _isExecutingMove = true;
+
+        // Visual-only delay — the card is already chosen, just letting the
+        // UI timer animate naturally so the bot feels like a human player.
         yield return new WaitForSeconds(delay);
 
         if (!_gameActive || _gs == null) yield break;
 
-        // If the turn key changed while we were waiting, a newer ProcessCurrentTurn
-        // already launched a fresh BotMoveCoroutine for the correct turn — bail out.
-        if (_lastProcessedTurnKey != expectedTurnKey) yield break;
-
-        // Re-check it's still this bot's turn AND they haven't played yet this round
+        // Safety: if the turn moved on while we were waiting, do nothing.
         if (_gs.CurrentPlayerId != botId) yield break;
         if (_gs.cardsInPlay.Exists(pc => pc.playerId == botId)) yield break;
 
-        // Mark move in-flight so the TurnTimerCoroutine bot-fallback does not
-        // fire a second AutoPlay while this one's async write is still pending.
+        if (card == "STEAL")
+            ExecuteSteal(botId);
+        else
+            ExecuteMove(botId, card);
+    }
+
+    private IEnumerator BotWatchdogCoroutine(string botId, int expectedTurnKey)
+    {
+        // Wait long enough that the normal BotMoveCoroutine + Firebase write
+        // should have completed even on a slow connection.
+        // TurnSeconds is the hard cap; we fire at 80% of that to leave
+        // a small buffer before the turn timer itself expires.
+        float watchdogDelay = GameState.TurnSeconds * 0.8f;
+        yield return new WaitForSeconds(watchdogDelay);
+
+        _botWatchdogCoroutine = null;
+
+        if (!_gameActive || _gs == null) yield break;
+
+        // Turn already advanced normally — nothing to do.
+        if (_lastProcessedTurnKey != expectedTurnKey) yield break;
+        if (_gs.CurrentPlayerId != botId) yield break;
+
+        // Bot has already played this round — nothing to do.
+        if (_gs.cardsInPlay.Exists(pc => pc.playerId == botId)) yield break;
+
+        // Move is currently executing (write in-flight) — give it a few more
+        // seconds before we intervene.
+        if (_isExecutingMove)
+        {
+            yield return new WaitForSeconds(5f);
+            // Re-check after extra wait
+            if (!_gameActive || _gs == null) yield break;
+            if (_lastProcessedTurnKey != expectedTurnKey) yield break;
+            if (_gs.CurrentPlayerId != botId) yield break;
+            if (_gs.cardsInPlay.Exists(pc => pc.playerId == botId)) yield break;
+        }
+
+        Debug.LogWarning($"[BotWatchdog] Bot {botId} never played — forcing move.");
+
+        StopBotCoroutine();
         _isExecutingMove = true;
-        AutoPlay(botId);
+
+        if (!_gs.hands.ContainsKey(botId) || _gs.hands[botId].Count == 0)
+        {
+            // The bot's hand is empty. We NEVER call CheckGameOver here directly.
+            // The watchdog may fire with a stale local _gs (e.g. the Firestore listener
+            // hasn't delivered the latest state yet). Calling CheckGameOver on stale
+            // state would declare a false winner and show WinView incorrectly.
+            //
+            // Instead, route through ExecuteMove with an empty card code. ExecuteMove
+            // already handles the empty-hand case: it removes the player as a winner
+            // and calls CheckGameOver only after writing the confirmed state to Firestore,
+            // which is the same safe path every normal turn uses.
+            Debug.LogWarning($"[BotWatchdog] Bot {botId} has empty hand — routing through ExecuteMove.");
+            _isExecutingMove = false;
+            ExecuteMove(botId, "");
+            yield break;
+        }
+
+        string card = useHardBot
+            ? ChooseHardBotCard(botId, _gs.hands[botId], IsBot)
+            : ChooseAutoCard(botId, _gs.hands[botId]);
+
+        if (card == "STEAL")
+            ExecuteSteal(botId);
+        else
+            ExecuteMove(botId, card);
     }
 
     private void StopBotCoroutine()
@@ -1450,6 +1562,15 @@ public class GameManager : MonoBehaviour
         {
             StopCoroutine(_botCoroutine);
             _botCoroutine = null;
+        }
+    }
+
+    private void StopBotWatchdog()
+    {
+        if (_botWatchdogCoroutine != null)
+        {
+            StopCoroutine(_botWatchdogCoroutine);
+            _botWatchdogCoroutine = null;
         }
     }
 
@@ -1584,7 +1705,9 @@ public class GameManager : MonoBehaviour
 
     private async Task WriteGameStateAndProcessAsync()
     {
-        _isExecutingMove = false;
+        // Do NOT reset _isExecutingMove here — keep it true until write is
+        // confirmed so the Firestore listener cannot start a second bot move
+        // while the async write is still in flight.
 
         const int maxAttempts = 4;
         const int delayBetweenMs = 500; // 4 attempts × 500 ms = 2 seconds total
@@ -1607,14 +1730,21 @@ public class GameManager : MonoBehaviour
             Debug.LogError(
                 "[GameManager] WriteGameStateAndProcess: all 4 write attempts failed — not advancing turn to prevent desync.");
             EventManager.FireShowPopUp("Network error. Please check your connection.");
+            _isExecutingMove = false; // release lock only on full failure
             return; // Do NOT advance turn — Firebase never confirmed the state
         }
 
-        // Firebase confirmed — safe to advance turn
+        // Firebase confirmed — safe to release lock and advance turn.
+        // STRICT RULE: Only the host calls ProcessCurrentTurn after a write.
+        // Non-host clients rely entirely on the Firestore listener to receive
+        // state updates and trigger ProcessCurrentTurn. If non-hosts also called
+        // ProcessCurrentTurn here, two clients would simultaneously execute bot
+        // moves for the same turn, causing duplicate writes and state corruption.
+        _isExecutingMove = false;
         EventManager.FireGameStateUpdated(_gs);
 
         if (_isHost && _gameActive)
-            ProcessCurrentTurn(); // Bot check and BotMoveCoroutine start here
+            ProcessCurrentTurn();
     }
 
     private void WriteGameStateAndProcess() => _ = WriteGameStateAndProcessAsync();

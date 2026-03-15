@@ -91,9 +91,6 @@ public class BotStrategy
 
     /// <summary>
     /// Main entry point called by GameManager.AutoPlay.
-    /// isBot delegate is passed from GameManager.IsBot so ghost-bot IDs
-    /// (players set as bots via turnPlayerToBot) are treated identically
-    /// to real BOT_ prefixed bots throughout all strategy logic.
     /// </summary>
     public string ChooseCard(GameState gs, string botId, List<string> hand, System.Func<string, bool> isBot)
     {
@@ -672,11 +669,11 @@ public class BotStrategy
     //    Bot1 chosen card = JH. No other bot has any Heart higher than J.
     //    → Play JH as-is.
     //
-    //  isBot delegate is used so ghost-bot players (set via turnPlayerToBot)
-    //  participate in swaps identically to real BOT_ prefixed bots.
+    //  isBot delegate is used to identify real bot players.
     // ═══════════════════════════════════════════════════════════════════════
 
-    private string UpgradeDiscardWithOtherBots(GameState gs, string botId, string chosenCard, System.Func<string, bool> isBot)
+    private string UpgradeDiscardWithOtherBots(GameState gs, string botId, string chosenCard,
+        System.Func<string, bool> isBot)
     {
         if (string.IsNullOrEmpty(chosenCard)) return chosenCard;
 
