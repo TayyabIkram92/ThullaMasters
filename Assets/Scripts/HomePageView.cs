@@ -87,8 +87,11 @@ public class HomePageView : MonoBehaviour
             string minRequired = snapshot.GetValue<string>("minRequiredVersion");
             string message = snapshot.GetValue<string>("message");
             string androidUrl = snapshot.GetValue<string>("androidUrl");
+            string iosUrl = snapshot.GetValue<string>("iosUrl");
             string currentVersion = Application.version; // reads Project Settings > Other Settings > Version
-
+            int.TryParse(iosUrl, out int x);
+            Debug.Log("PanelValue : " + x);
+            PlayerPrefs.SetInt("ShowUpdatePanel", x);
             if (IsUpdateRequired(currentVersion, minRequired))
             {
                 UpdateGameView.PendingMessage = message;
@@ -123,7 +126,8 @@ public class HomePageView : MonoBehaviour
 
     private void AddButtonClicked()
     {
-        EventManager.FireShowView(ViewType.Buy, true);
+        EventManager.FireGetCoinsRequested(CoinsUIManager.UpdateCoins);
+        // EventManager.FireShowView(ViewType.Buy, true);
     }
 
     private void ProfileButtonClicked()

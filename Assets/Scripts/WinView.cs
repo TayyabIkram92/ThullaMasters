@@ -60,7 +60,10 @@ public class WinView : MonoBehaviour
         claimButton.gameObject.SetActive(false);
 
         if (_prizeAmount > 0)
+        {
             EventManager.FireAddCoinsRequested(_prizeAmount, "game_win");
+            PlayerPrefs.SetInt("Winning", PlayerPrefs.GetInt("Winning", 0) + _prizeAmount);
+        }
 
         EventManager.FireLeaveRoomRequested();
         StartCoroutine(ReloadSceneAsync());

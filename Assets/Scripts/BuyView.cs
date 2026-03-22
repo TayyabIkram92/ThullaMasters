@@ -25,6 +25,9 @@ public class BuyView : MonoBehaviour
 
     [Header("Action")] [SerializeField] private Button confirmButton;
     [SerializeField] private Button closeButton;
+    [SerializeField] private Button howToBuyButton;
+
+    [SerializeField] private string howToBuyUrl;
 
     private Texture2D _selectedScreenshot;
     private bool _screenshotSelected = false;
@@ -38,6 +41,7 @@ public class BuyView : MonoBehaviour
         uploadScreenshotButton.onClick.AddListener(OnUploadScreenshot);
         confirmButton.onClick.AddListener(OnConfirmClicked);
         closeButton.onClick.AddListener(OnCloseClicked);
+        howToBuyButton.onClick.AddListener(OnHowToBuyClicked);
         amountInputField.onValueChanged.AddListener(OnAmountChanged);
 
         PopulateBankInfo();
@@ -50,7 +54,13 @@ public class BuyView : MonoBehaviour
         uploadScreenshotButton.onClick.RemoveListener(OnUploadScreenshot);
         confirmButton.onClick.RemoveListener(OnConfirmClicked);
         closeButton.onClick.RemoveListener(OnCloseClicked);
+        howToBuyButton.onClick.RemoveListener(OnHowToBuyClicked);
         amountInputField.onValueChanged.RemoveListener(OnAmountChanged);
+    }
+
+    private void OnHowToBuyClicked()
+    {
+        Application.OpenURL(howToBuyUrl);
     }
 
     private void PopulateBankInfo()

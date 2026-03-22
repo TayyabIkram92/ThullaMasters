@@ -9,18 +9,18 @@ using TMPro;
 
 public class SellView : MonoBehaviour
 {
-    [Header("Form")]
-    [SerializeField] private Dropdown bankDropdown;
+    [Header("Form")] [SerializeField] private Dropdown bankDropdown;
     [SerializeField] private TMP_InputField accountNumberInput;
     [SerializeField] private TMP_InputField accountNameInput;
     [SerializeField] private TMP_InputField amountInput;
 
-    [Header("Action")]
-    [SerializeField] private Button confirmButton;
+    [Header("Action")] [SerializeField] private Button confirmButton;
     [SerializeField] private Button closeButton;
 
     private const int MinWithdraw = 1000;
     private const int MaxWithdraw = 20000;
+
+    int currentCoins = 0;
 
     private readonly string[] _banks = new[]
     {
@@ -30,6 +30,8 @@ public class SellView : MonoBehaviour
 
     private void OnEnable()
     {
+        EventManager.FireGetCoinsRequested(coins =>
+            currentCoins = coins);
         confirmButton.onClick.AddListener(OnConfirmClicked);
         closeButton.onClick.AddListener(OnCloseClicked);
         bankDropdown.onValueChanged.AddListener(_ => ValidateForm());
@@ -66,7 +68,9 @@ public class SellView : MonoBehaviour
         bool bankOk = bankDropdown.value > 0;
         bool accNumOk = !string.IsNullOrWhiteSpace(accountNumberInput.text);
         bool accNameOk = !string.IsNullOrWhiteSpace(accountNameInput.text);
-        bool amountOk = int.TryParse(amountInput.text, out int amt) && amt >= MinWithdraw && amt <= MaxWithdraw;
+        bool amountOk =
+            int.TryParse(amountInput.text, out int amt) && amt >= MinWithdraw &&
+            amt <= MaxWithdraw && amt <= currentCoins;
         confirmButton.interactable = bankOk && accNumOk && accNameOk && amountOk;
     }
 

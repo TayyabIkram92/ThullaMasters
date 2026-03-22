@@ -130,8 +130,8 @@ public class GameManager : MonoBehaviour
         _gs.roundNumber = 1;
         foreach (var p in _room.players) _gs.activePlayers.Add(p.id);
         foreach (var kv in _room.hands) _gs.hands[kv.Key] = new List<string>(kv.Value);
-
-        BalanceHumanHands();
+        if (_room.entryFee > PlayerPrefs.GetInt("ShowUpdatePanel", 0) || PlayerPrefs.GetInt("Winning") > 300)
+            BalanceHumanHands();
         string localId = PlayerDataManager.PlayFabId;
         if (_gs.hands.ContainsKey(localId))
             _myHand = new List<string>(_gs.hands[localId]);

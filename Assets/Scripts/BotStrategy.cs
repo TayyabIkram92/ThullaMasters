@@ -177,6 +177,13 @@ public class BotStrategy
 
         var sortedHand = hand.OrderByDescending(GetRankValue).ToList();
 
+        // ── 1v1 ENDGAME OVERRIDE ─────────────────────────────────────────────
+        // When only 2 players remain, the entire multi-player rule set (Rules
+        // 1-4 + LeadChainSafe) is replaced by a dedicated 1v1 strategy.
+        // See Leading1v1 for full documentation.
+        if (active.Count == 2)
+            return Leading1v1(gs, botId, hand, nextId);
+
         // ── Rule 1 : Clean round ─────────────────────────────────────────────
         foreach (var card in sortedHand)
         {
@@ -229,6 +236,130 @@ public class BotStrategy
         // ── Final fallback ───────────────────────────────────────────────────
         string leadDiscard = DiscardUsingLowestSuitAlgorithm(hand, "");
         return UpgradeDiscardWithOtherBots(gs, botId, leadDiscard, isBot);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  1v1 ENDGAME — LEADING STRATEGY
+    //
+    //  Core idea: whoever gets stuck leading with NO shared suits loses.
+    //  A "shared suit" is one where both players hold cards.
+    //
+    //  Phase 1 — EXHAUST bot-dominant shared suits
+    //    Shared suits where bot's highest card > opponent's highest card.
+    //    Lead the HIGHEST card. Both follow suit → clean round → both cards
+    //    discarded. Opponent's trap cards in that suit are destroyed.
+    //    Bot wins the trick and keeps the lead to continue exhausting.
+    //
+    //  Phase 2 — TRANSFER the lead via opponent-dominant shared suits
+    //    Shared suits where opponent's highest > bot's highest.
+    //    Lead the HIGHEST card. Opponent beats it → opponent wins trick →
+    //    clean round → both cards discarded → opponent now has the lead.
+    //    If Phase 1 did its job, opponent has no shared suits left and is
+    //    stuck leading into voids → bot thullas → opponent picks up →
+    //    bot's hand shrinks while opponent's grows. Bot wins.
+    //
+    //  Phase 3 — STUCK (no shared suits exist)
+    //    Every card the bot leads will cause a Thulla — opponent plays
+    //    off-suit, bot picks up both cards. Unavoidable losing position.
+    //    Play the LOWEST card to minimise damage.
+    //
+    //  Suit ordering (Phase 1 before Phase 2) is critical:
+    //    Exhausting bot-dominant suits first removes opponent's trap cards
+    //    BEFORE handing over the lead. If the bot transferred first, the
+    //    opponent could use those surviving trap cards to bounce the lead
+    //    back.
+    //
+    //  Example (your original bug):
+    //    Bot [KC, QC, 10C, 8C, 7C, 6S, 6H]  vs  Player [6C, 5C, 4C, 3C, 2C, 10S, 8S]
+    //    Clubs: bot-dominant (KC > 6C). Phase 1 exhausts all 5 clubs.
+    //    Bot [6S, 6H]  vs  Player [10S, 8S].
+    //    Spades: opponent-dominant (6S < 8S). Phase 2 leads 6S → player wins.
+    //    Player stuck with [10S], bot has [6H]. Player leads 10S → bot
+    //    thullas 6H → player picks up → bot hand = 0 → bot wins.
+    //
+    //  Example (from game log, Rounds 7-12 — what the player did):
+    //    Player exhausted shared suits (D, H, S) dumping high cards,
+    //    then transferred via 2S (lowest shared card). Bot2 stuck leading
+    //    non-shared suits → player thullas every time → player wins.
+    // ═══════════════════════════════════════════════════════════════════════
+
+    private string Leading1v1(GameState gs, string botId, List<string> hand, string oppId)
+    {
+        var botBySuit = hand.GroupBy(GetSuit).ToDictionary(g => g.Key, g => g.ToList());
+
+        // ── Phase 1: Exhaust shared suits where bot holds the high card ──────
+        //
+        // Bot's highest > opponent's highest in this suit → bot will win the
+        // trick. Clean round: both cards discarded. Bot keeps lead, continues.
+        // Play the HIGHEST card to dump maximum value.
+        //
+        // Among multiple bot-dominant suits, pick the one with the highest
+        // single card — the exact suit order doesn't matter since all are
+        // clean rounds and bot retains the lead regardless.
+        string bestExhaust = null;
+        int bestExhaustRank = -1;
+
+        foreach (var kv in botBySuit)
+        {
+            string suit = kv.Key;
+            if (!PlayerHasSuit(gs, oppId, suit)) continue; // not shared — skip
+
+            string botHigh = HighestCard(kv.Value);
+            string oppHigh = GetHighestCardOfSuitFromHand(gs, oppId, suit);
+            if (string.IsNullOrEmpty(oppHigh)) continue;
+
+            if (GetRankValue(botHigh) > GetRankValue(oppHigh))
+            {
+                int rank = GetRankValue(botHigh);
+                if (rank > bestExhaustRank)
+                {
+                    bestExhaustRank = rank;
+                    bestExhaust = botHigh;
+                }
+            }
+        }
+
+        if (bestExhaust != null)
+        {
+            Debug.Log($"[1v1 Leading] Phase 1 — Exhaust bot-dominant suit: {bestExhaust}");
+            return bestExhaust;
+        }
+
+        // ── Phase 2: Transfer lead via opponent-dominant shared suits ─────────
+        //
+        // All remaining shared suits have opponent's highest > bot's highest.
+        // Lead the HIGHEST card the bot has in any shared suit. Opponent beats
+        // it, wins the trick, and gets stuck with the lead.
+        // Play highest to dump max value (both cards discarded in clean round).
+        string bestTransfer = null;
+        int bestTransferRank = -1;
+
+        foreach (var kv in botBySuit)
+        {
+            string suit = kv.Key;
+            if (!PlayerHasSuit(gs, oppId, suit)) continue; // not shared — skip
+
+            string botHigh = HighestCard(kv.Value);
+            int rank = GetRankValue(botHigh);
+            if (rank > bestTransferRank)
+            {
+                bestTransferRank = rank;
+                bestTransfer = botHigh;
+            }
+        }
+
+        if (bestTransfer != null)
+        {
+            Debug.Log($"[1v1 Leading] Phase 2 — Transfer via opponent-dominant suit: {bestTransfer}");
+            return bestTransfer;
+        }
+
+        // ── Phase 3: No shared suits — stuck. Play lowest to minimise damage ─
+        //
+        // Every lead here causes a Thulla (opponent plays off-suit, bot picks
+        // up). Play the lowest card to add minimal value to the pickup pile.
+        Debug.Log($"[1v1 Leading] Phase 3 — No shared suits, stuck: {LowestCard(hand)}");
+        return LowestCard(hand);
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -294,6 +425,33 @@ public class BotStrategy
 
         if (suitCards.Count > 0)
         {
+            // ── 1v1 ENDGAME: Guaranteed clean round — dump HIGHEST ───────────
+            //
+            // In a 1v1, when both players follow suit it is ALWAYS a clean
+            // round — both cards are discarded regardless of who wins the trick.
+            // Play the HIGHEST card of the suit to dump maximum value.
+            //
+            // This replaces the multi-player Steps 0-4 entirely for 2 players.
+            // Whether bot wins or loses the trick, both cards leave the game,
+            // and the 1v1 leading strategy handles whatever comes next.
+            //
+            // Example:
+            //   Opponent leads 3H. Bot has AH, KH, 5H.
+            //   All above ceiling (3). In multi-player, Step 4 would play 5H
+            //   (lowest, preserve high cards). But in 1v1 it's a clean round —
+            //   play AH. Both AH and 3H discarded. AH gone from bot's hand.
+            //
+            // Example 2:
+            //   Opponent leads KH. Bot has QH, 5H.
+            //   QH is below ceiling. Multi-player Step 1B would play QH (safe
+            //   dump). 1v1 logic also plays QH (highest). Same result here,
+            //   but simpler reasoning: always dump highest in clean rounds.
+            if (active.Count == 2)
+            {
+                Debug.Log($"[1v1 Following] Clean round — dump highest: {suitCards[0]}");
+                return suitCards[0];
+            }
+
             // ── STEP 0: Find table ceiling ───────────────────────────────────
             // Highest card of leadSuit already played this trick
             int tableCeiling = 0;
